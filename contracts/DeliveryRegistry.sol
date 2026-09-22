@@ -43,4 +43,20 @@ contract DeliveryRegistry {
     constructor() {
         admin = msg.sender;
     }
+
+    function allowRoute(address supplier, address receiver) external {
+        require(msg.sender == admin, "Only admin");
+        require(
+            supplier != address(0) && receiver != address(0),
+            "Invalid address"
+        );
+        require(
+            supplier != receiver,
+            "Supplier and receiver cannot be the same"
+        );
+        require(!allowedRoutes[supplier][receiver], "Route already allowed");
+        allowedRoutes[supplier][receiver] = true;
+
+        emit RouteAllowed(supplier, receiver);
+    }
 }
