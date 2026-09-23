@@ -59,4 +59,37 @@ contract DeliveryRegistry {
 
         emit RouteAllowed(supplier, receiver);
     }
+
+    function submitDelivery(
+        address receiver,
+        string calldata productName,
+        string calldata version,
+        bytes32 sbomHash,
+        bytes32 fileHash
+    ) external returns (uint256) {
+        require(allowedRoutes[msg.sender][receiver], "Route not allowed");
+        require(bytes(productName).length > 0, "Product name required");
+        require(bytes(version).length > 0, "Version required");
+        require(sbomHash != bytes32(0), "SBOM hash required");
+        require(fileHash != bytes32(0), "File hash required");
+
+        deliveryCount++;
+        uint256 deliveryId = deliveryCount;
+
+        deliveries[deliveryId] = Delivery({
+            supplier: msg.sender,
+            receiver: receiver,
+            productName: productName,
+            version: version,
+            sbomHash: sbomHash,
+            fileHash: fileHash,
+            status: Status.Pending,
+            submittedAt: block.timestamp,
+            reviewedAt: 0
+        });
+
+        emit DeliverySubmitted(deliveryId, msg.sender, receiver);
+
+        return deliveryId;
+    }
 }
