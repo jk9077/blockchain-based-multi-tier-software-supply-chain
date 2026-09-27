@@ -33,6 +33,16 @@ contract DeliverySupplier {
     }
 }
 
+contract DeliveryReceiver {
+    function review(
+        DeliveryRegistry registry,
+        uint256 deliveryId,
+        DeliveryRegistry.Status status
+    ) external {
+        registry.reviewDelivery(deliveryId, status);
+    }
+}
+
 contract DeliveryRegistryTest {
     function test_AdminCanAllowRoute() public {
         DeliveryRegistry registry = new DeliveryRegistry();
@@ -162,6 +172,165 @@ contract DeliveryRegistryTest {
         require(
             blocked,
             "Should not be able to retrieve non-existent delivery"
+        );
+    }
+
+    function test_ReceiverCanReviewDelivery() public {
+        DeliveryRegistry registry = new DeliveryRegistry();
+        DeliverySupplier supplier = new DeliverySupplier();
+        DeliveryReceiver receiver = new DeliveryReceiver();
+
+        registry.allowRoute(address(supplier), address(receiver));
+
+        uint256 deliveryId = supplier.submit(
+            registry,
+            address(receiver),
+            "Payment Module",
+            "1.0.0",
+            keccak256(bytes("sample SBOM")),
+            keccak256(bytes("sample artifact"))
+        );
+
+        receiver.review(registry, deliveryId, DeliveryRegistry.Status.Approved);
+
+        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
+            deliveryId
+        );
+
+        require(
+            saved.status == DeliveryRegistry.Status.Approved,
+            "Delivery should be approved"
+        );
+        require(saved.reviewedAt == block.timestamp, "Wrong review time");
+    }
+
+    function test_ReceiverCanRejectDelivery() public {
+        DeliveryRegistry registry = new DeliveryRegistry();
+        DeliverySupplier supplier = new DeliverySupplier();
+        DeliveryReceiver receiver = new DeliveryReceiver();
+
+        registry.allowRoute(address(supplier), address(receiver));
+
+        uint256 deliveryId = supplier.submit(
+            registry,
+            address(receiver),
+            "Payment Module",
+            "1.0.0",
+            keccak256(bytes("sample SBOM")),
+            keccak256(bytes("sample artifact"))
+        );
+
+        receiver.review(registry, deliveryId, DeliveryRegistry.Status.Rejected);
+
+        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
+            deliveryId
+        );
+
+        require(
+            saved.status == DeliveryRegistry.Status.Rejected,
+            "Delivery should be rejected"
+        );
+        require(saved.reviewedAt == block.timestamp, "Wrong review time");
+    }
+
+    function test_OtherCompanyCannotReviewDelivery() public {
+        DeliveryRegistry registry = new DeliveryRegistry();
+        DeliverySupplier supplier = new DeliverySupplier();
+        DeliveryReceiver receiver = new DeliveryReceiver();
+
+        DeliveryReceiver otherReceiver = new DeliveryReceiver();
+
+        registry.allowRoute(address(supplier), address(receiver));
+
+        uint256 deliveryId = supplier.submit(
+            registry,
+            address(receiver),
+            "Payment Module",
+            "1.0.0",
+            keccak256(bytes("sample SBOM")),
+            keccak256(bytes("sample artifact"))
+        );
+
+        bool blocked = false;
+
+        try
+            otherReceiver.review(
+                registry,
+                deliveryId,
+                DeliveryRegistry.Status.Approved
+            )
+        {
+            blocked = false;
+        } catch Error(string memory reason) {
+            blocked =
+                keccak256(bytes(reason)) ==
+                keccak256(bytes("Only receiver can review"));
+        }
+
+        require(blocked, "Other company should be blocked");
+
+        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
+            deliveryId
+        );
+
+        require(
+            saved.status == DeliveryRegistry.Status.Pending,
+            "Status should remain pending"
+        );
+        require(saved.reviewedAt == 0, "Review time should remain zero");
+    }
+
+    function test_ReviewedDeliveryCannotBeReviewedAgain() public {
+        DeliveryRegistry registry = new DeliveryRegistry();
+        DeliverySupplier supplier = new DeliverySupplier();
+        DeliveryReceiver receiver = new DeliveryReceiver();
+
+        registry.allowRoute(address(supplier), address(receiver));
+
+        uint256 deliveryId = supplier.submit(
+            registry,
+            address(receiver),
+            "Payment Module",
+            "1.0.0",
+            keccak256(bytes("sample SBOM")),
+            keccak256(bytes("sample artifact"))
+        );
+
+        receiver.review(registry, deliveryId, DeliveryRegistry.Status.Approved);
+
+        DeliveryRegistry.Delivery memory beforeReview = registry.getDelivery(
+            deliveryId
+        );
+
+        bool blocked = false;
+
+        try
+            receiver.review(
+                registry,
+                deliveryId,
+                DeliveryRegistry.Status.Rejected
+            )
+        {
+            blocked = false;
+        } catch Error(string memory reason) {
+            blocked =
+                keccak256(bytes(reason)) ==
+                keccak256(bytes("Delivery already reviewed"));
+        }
+
+        require(blocked, "Second review should be blocked");
+
+        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
+            deliveryId
+        );
+
+        require(
+            saved.status == DeliveryRegistry.Status.Approved,
+            "Status should remain approved"
+        );
+        require(
+            saved.reviewedAt == beforeReview.reviewedAt,
+            "Review time should not change"
         );
     }
 }

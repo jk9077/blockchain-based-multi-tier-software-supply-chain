@@ -34,7 +34,7 @@ contract DeliveryRegistry {
         address indexed receiver
     );
 
-    event DeliverReviewed(
+    event DeliveryReviewed(
         uint256 indexed deliveryId,
         address indexed reviewer,
         Status status
@@ -91,5 +91,35 @@ contract DeliveryRegistry {
         emit DeliverySubmitted(deliveryId, msg.sender, receiver);
 
         return deliveryId;
+    }
+
+    function reviewDelivery(uint256 deliveryId, Status status) external {
+        require(
+            deliveryId > 0 && deliveryId <= deliveryCount,
+            "Delivery not found"
+        );
+        Delivery storage delivery = deliveries[deliveryId];
+
+        require(msg.sender == delivery.receiver, "Only receiver can review");
+        require(delivery.status == Status.Pending, "Delivery already reviewed");
+        require(
+            status == Status.Approved || status == Status.Rejected,
+            "Invalid review status"
+        );
+
+        delivery.status = status;
+        delivery.reviewedAt = block.timestamp;
+        emit DeliveryReviewed(deliveryId, msg.sender, status);
+    }
+
+    function getDelivery(
+        uint256 deliveryId
+    ) external view returns (Delivery memory) {
+        require(
+            deliveryId > 0 && deliveryId <= deliveryCount,
+            "Delivery not found"
+        );
+
+        return deliveries[deliveryId];
     }
 }
