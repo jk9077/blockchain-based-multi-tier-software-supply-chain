@@ -50,6 +50,9 @@ contract DeliveryRegistry {
     mapping(uint256 => mapping(uint256 => mapping(uint256 => uint256)))
         private deliveryIdsByProject;
 
+    mapping(uint256 => uint256) public replacesDeliveryIds;
+    mapping(uint256 => uint256) public resubmittedDeliveryIds;
+
     event ProjectCreated(uint256 indexed projectId, string name);
 
     event RouteAllowed(
@@ -75,6 +78,12 @@ contract DeliveryRegistry {
         uint256 stageDeliveryNumber,
         address indexed reviewer,
         Status status
+    );
+
+    event DeliveryResubmitted(
+        uint256 indexed originalDeliveryId,
+        uint256 indexed newDeliveryId,
+        address indexed supplier
     );
 
     constructor() {
@@ -132,12 +141,12 @@ contract DeliveryRegistry {
     function submitDelivery(
         uint256 projectId,
         address receiver,
-        string calldata productName,
-        string calldata version,
+        string memory productName,
+        string memory version,
         bytes32 sbomHash,
         bytes32 fileHash,
         uint256[] calldata previousIds
-    ) external returns (uint256) {
+    ) public returns (uint256) {
         _requireProject(projectId);
 
         require(
@@ -305,6 +314,49 @@ contract DeliveryRegistry {
             delivery.supplier,
             delivery.receiver
         );
+    }
+    function resubmitDelivery(
+        uint256 originalDeliveryId,
+        string calldata version,
+        bytes32 sbomHash,
+        bytes32 fileHash,
+        uint256[] calldata previousIds
+    ) external returns (uint256) {
+        _requireDelivery(originalDeliveryId);
+
+        Delivery storage original = deliveries[originalDeliveryId];
+
+        require(
+            msg.sender == original.supplier,
+            "Only original supplier can resubmit"
+        );
+
+        require(
+            original.status == Status.Rejected,
+            "Only rejected delivery can be resubmitted"
+        );
+
+        require(
+            resubmittedDeliveryIds[originalDeliveryId] == 0,
+            "Delivery already resubmitted"
+        );
+
+        uint256 newDeliveryId = submitDelivery(
+            original.projectId,
+            original.receiver,
+            original.productName,
+            version,
+            sbomHash,
+            fileHash,
+            previousIds
+        );
+
+        replacesDeliveryIds[newDeliveryId] = originalDeliveryId;
+        resubmittedDeliveryIds[originalDeliveryId] = newDeliveryId;
+
+        emit DeliveryResubmitted(originalDeliveryId, newDeliveryId, msg.sender);
+
+        return newDeliveryId;
     }
 
     function _requireProject(uint256 projectId) private view {

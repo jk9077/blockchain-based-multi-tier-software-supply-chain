@@ -37,6 +37,23 @@ contract DeliverySupplier {
                 previousIds
             );
     }
+    function resubmit(
+        DeliveryRegistry registry,
+        uint256 originalDeliveryId,
+        string calldata version,
+        bytes32 sbomHash,
+        bytes32 fileHash,
+        uint256[] calldata previousIds
+    ) external returns (uint256) {
+        return
+            registry.resubmitDelivery(
+                originalDeliveryId,
+                version,
+                sbomHash,
+                fileHash,
+                previousIds
+            );
+    }
 }
 
 contract DeliveryReceiver is DeliverySupplier {
@@ -640,6 +657,284 @@ contract DeliveryRegistryTest {
         require(
             registry.stageDeliveryCounts(projectId, 1) == 1,
             "Failed submission should not consume sequence"
+        );
+    }
+    function test_SupplierCanResubmitRejectedDelivery() public {
+        (
+            DeliveryRegistry registry,
+            DeliveryReceiver receiver,
+            uint256 originalId
+        ) = _reviewSetup();
+
+        receiver.review(registry, originalId, DeliveryRegistry.Status.Rejected);
+
+        DeliveryRegistry.Delivery memory original = registry.getDelivery(
+            originalId
+        );
+
+        DeliverySupplier supplier = DeliverySupplier(original.supplier);
+
+        bytes32 newSbomHash = keccak256(bytes("revised SBOM"));
+        bytes32 newFileHash = keccak256(bytes("revised artifact"));
+
+        uint256 newId = supplier.resubmit(
+            registry,
+            originalId,
+            "1.0.1",
+            newSbomHash,
+            newFileHash,
+            new uint256[](0)
+        );
+
+        DeliveryRegistry.Delivery memory revised = registry.getDelivery(newId);
+
+        require(newId != originalId, "New delivery ID required");
+        require(registry.deliveryCount() == 2, "Wrong delivery count");
+
+        require(
+            revised.projectId == original.projectId,
+            "Project should remain the same"
+        );
+
+        require(
+            revised.stage == original.stage,
+            "Stage should remain the same"
+        );
+
+        require(revised.stageDeliveryNumber == 2, "Wrong revision sequence");
+
+        require(
+            revised.supplier == original.supplier,
+            "Supplier should remain the same"
+        );
+
+        require(
+            revised.receiver == original.receiver,
+            "Receiver should remain the same"
+        );
+
+        require(
+            _same(revised.productName, original.productName),
+            "Product name should remain the same"
+        );
+
+        require(_same(revised.version, "1.0.1"), "Wrong revised version");
+        require(revised.sbomHash == newSbomHash, "Wrong revised SBOM hash");
+        require(revised.fileHash == newFileHash, "Wrong revised file hash");
+
+        require(
+            revised.status == DeliveryRegistry.Status.Pending,
+            "Revision should start pending"
+        );
+
+        require(revised.reviewedAt == 0, "Revision should not be reviewed");
+
+        require(
+            revised.submittedAt == block.timestamp,
+            "Wrong revision submission time"
+        );
+
+        require(
+            registry.replacesDeliveryIds(newId) == originalId,
+            "Missing link to original delivery"
+        );
+
+        require(
+            registry.resubmittedDeliveryIds(originalId) == newId,
+            "Missing link to revised delivery"
+        );
+
+        require(
+            registry.getDeliveryId(
+                revised.projectId,
+                revised.stage,
+                revised.stageDeliveryNumber
+            ) == newId,
+            "Wrong revision number lookup"
+        );
+
+        DeliveryRegistry.Delivery memory unchanged = registry.getDelivery(
+            originalId
+        );
+
+        require(
+            keccak256(abi.encode(unchanged)) == keccak256(abi.encode(original)),
+            "Original delivery must remain unchanged"
+        );
+
+        receiver.review(registry, newId, DeliveryRegistry.Status.Approved);
+
+        require(
+            registry.getDelivery(newId).status ==
+                DeliveryRegistry.Status.Approved,
+            "Receiver should be able to approve revision"
+        );
+    }
+
+    function test_OtherSupplierCannotResubmitDelivery() public {
+        (
+            DeliveryRegistry registry,
+            DeliveryReceiver receiver,
+            uint256 originalId
+        ) = _reviewSetup();
+
+        receiver.review(registry, originalId, DeliveryRegistry.Status.Rejected);
+
+        DeliverySupplier other = new DeliverySupplier();
+
+        uint256 projectId = registry.getDelivery(originalId).projectId;
+
+        registry.allowRoute(projectId, address(other), address(receiver), 1);
+
+        bool blocked = false;
+
+        try
+            other.resubmit(
+                registry,
+                originalId,
+                "1.0.1",
+                keccak256(bytes("revised SBOM")),
+                keccak256(bytes("revised artifact")),
+                new uint256[](0)
+            )
+        returns (uint256) {
+            blocked = false;
+        } catch Error(string memory reason) {
+            blocked = _same(reason, "Only original supplier can resubmit");
+        }
+
+        require(blocked, "Other supplier should be blocked");
+        require(registry.deliveryCount() == 1, "No revision should be created");
+
+        require(
+            registry.resubmittedDeliveryIds(originalId) == 0,
+            "No revision link should be saved"
+        );
+    }
+
+    function test_PendingOrApprovedDeliveryCannotBeResubmitted() public {
+        (
+            DeliveryRegistry registry,
+            DeliveryReceiver receiver,
+            uint256 originalId
+        ) = _reviewSetup();
+
+        DeliverySupplier supplier = DeliverySupplier(
+            registry.getDelivery(originalId).supplier
+        );
+
+        bool pendingBlocked = false;
+
+        try
+            supplier.resubmit(
+                registry,
+                originalId,
+                "1.0.1",
+                keccak256(bytes("revised SBOM")),
+                keccak256(bytes("revised artifact")),
+                new uint256[](0)
+            )
+        returns (uint256) {
+            pendingBlocked = false;
+        } catch Error(string memory reason) {
+            pendingBlocked = _same(
+                reason,
+                "Only rejected delivery can be resubmitted"
+            );
+        }
+
+        require(pendingBlocked, "Pending delivery should be blocked");
+
+        receiver.review(registry, originalId, DeliveryRegistry.Status.Approved);
+
+        bool approvedBlocked = false;
+
+        try
+            supplier.resubmit(
+                registry,
+                originalId,
+                "1.0.1",
+                keccak256(bytes("revised SBOM")),
+                keccak256(bytes("revised artifact")),
+                new uint256[](0)
+            )
+        returns (uint256) {
+            approvedBlocked = false;
+        } catch Error(string memory reason) {
+            approvedBlocked = _same(
+                reason,
+                "Only rejected delivery can be resubmitted"
+            );
+        }
+
+        require(approvedBlocked, "Approved delivery should be blocked");
+        require(registry.deliveryCount() == 1, "No revision should be created");
+
+        require(
+            registry.resubmittedDeliveryIds(originalId) == 0,
+            "No revision link should be saved"
+        );
+
+        require(
+            registry.getDelivery(originalId).status ==
+                DeliveryRegistry.Status.Approved,
+            "Original status should remain approved"
+        );
+    }
+
+    function test_SameDeliveryCannotBeResubmittedTwice() public {
+        (
+            DeliveryRegistry registry,
+            DeliveryReceiver receiver,
+            uint256 originalId
+        ) = _reviewSetup();
+
+        receiver.review(registry, originalId, DeliveryRegistry.Status.Rejected);
+
+        DeliverySupplier supplier = DeliverySupplier(
+            registry.getDelivery(originalId).supplier
+        );
+
+        uint256 newId = supplier.resubmit(
+            registry,
+            originalId,
+            "1.0.1",
+            keccak256(bytes("revised SBOM")),
+            keccak256(bytes("revised artifact")),
+            new uint256[](0)
+        );
+
+        bool blocked = false;
+
+        try
+            supplier.resubmit(
+                registry,
+                originalId,
+                "1.0.2",
+                keccak256(bytes("another SBOM")),
+                keccak256(bytes("another artifact")),
+                new uint256[](0)
+            )
+        returns (uint256) {
+            blocked = false;
+        } catch Error(string memory reason) {
+            blocked = _same(reason, "Delivery already resubmitted");
+        }
+
+        require(blocked, "Duplicate resubmission should be blocked");
+        require(
+            registry.deliveryCount() == 2,
+            "No extra revision should be created"
+        );
+
+        require(
+            registry.resubmittedDeliveryIds(originalId) == newId,
+            "Existing revision link should remain"
+        );
+
+        require(
+            registry.replacesDeliveryIds(newId) == originalId,
+            "Existing original link should remain"
         );
     }
 
