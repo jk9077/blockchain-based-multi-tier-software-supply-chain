@@ -1,993 +1,353 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {Test} from "forge-std/Test.sol";
 import {DeliveryRegistry} from "../contracts/DeliveryRegistry.sol";
 
-contract OtherCaller {
-    function allowRoute(
-        DeliveryRegistry registry,
-        uint256 projectId,
-        address supplier,
-        address receiver,
-        uint256 stage
-    ) external {
-        registry.allowRoute(projectId, supplier, receiver, stage);
-    }
-}
-
-contract DeliverySupplier {
-    function submit(
-        DeliveryRegistry registry,
-        uint256 projectId,
-        address receiver,
-        string calldata productName,
-        string calldata version,
-        bytes32 sbomHash,
-        bytes32 fileHash,
-        uint256[] calldata previousIds
-    ) external returns (uint256) {
-        return
-            registry.submitDelivery(
-                projectId,
-                receiver,
-                productName,
-                version,
-                sbomHash,
-                fileHash,
-                previousIds
-            );
-    }
-    function resubmit(
-        DeliveryRegistry registry,
-        uint256 originalDeliveryId,
-        string calldata version,
-        bytes32 sbomHash,
-        bytes32 fileHash,
-        uint256[] calldata previousIds
-    ) external returns (uint256) {
-        return
-            registry.resubmitDelivery(
-                originalDeliveryId,
-                version,
-                sbomHash,
-                fileHash,
-                previousIds
-            );
-    }
-}
-
-contract DeliveryReceiver is DeliverySupplier {
-    function review(
-        DeliveryRegistry registry,
-        uint256 deliveryId,
-        DeliveryRegistry.Status status
-    ) external {
-        registry.reviewDelivery(deliveryId, status);
-    }
-}
-
-contract DeliveryRegistryTest {
-    function test_AdminCanAllowRoute() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-
-        uint256 projectId = registry.createProject("Project A");
-
-        address supplier = address(0x1001);
-        address receiver = address(0x1002);
-
-        registry.allowRoute(projectId, supplier, receiver, 1);
-
-        require(registry.admin() == address(this), "Wrong admin");
-        require(projectId == 1, "Project ID should be 1");
-        require(registry.projectCount() == 1, "Wrong project count");
-
-        require(
-            registry.allowedRoutes(projectId, supplier, receiver),
-            "Admin should be able to register route"
-        );
-
-        require(
-            registry.routeStages(projectId, supplier, receiver) == 1,
-            "Wrong route stage"
-        );
-    }
-
-    function test_NonAdminCannotAllowRoute() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        OtherCaller other = new OtherCaller();
-
-        uint256 projectId = registry.createProject("Project A");
-
-        address supplier = address(0x1001);
-        address receiver = address(0x1002);
-
-        bool blocked = false;
-
-        try other.allowRoute(registry, projectId, supplier, receiver, 1) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Only admin");
-        }
-
-        require(blocked, "Non-admin should be blocked");
-
-        require(
-            !registry.allowedRoutes(projectId, supplier, receiver),
-            "Unauthorized route should not be registered"
-        );
-
-        require(
-            registry.routeStages(projectId, supplier, receiver) == 0,
-            "Unauthorized stage should not be registered"
-        );
-    }
-
-    function test_AllowedSupplierCanSubmitDelivery() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        DeliverySupplier supplier = new DeliverySupplier();
-
-        uint256 projectId = registry.createProject("Project A");
-        address receiver = address(0x2001);
-
-        bytes32 sbomHash = keccak256(bytes("sample SBOM"));
-        bytes32 fileHash = keccak256(bytes("sample artifact"));
-
-        registry.allowRoute(projectId, address(supplier), receiver, 1);
-
-        uint256 deliveryId = supplier.submit(
-            registry,
-            projectId,
-            receiver,
-            "Payment Module",
-            "1.0.0",
-            sbomHash,
-            fileHash,
-            new uint256[](0)
-        );
-
-        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
-            deliveryId
-        );
-
-        require(deliveryId == 1, "Delivery ID should be 1");
-        require(registry.deliveryCount() == 1, "Wrong delivery count");
-        require(saved.projectId == projectId, "Wrong project");
-        require(saved.stage == 1, "Wrong stage");
-        require(saved.stageDeliveryNumber == 1, "Wrong stage sequence");
-        require(saved.supplier == address(supplier), "Wrong supplier");
-        require(saved.receiver == receiver, "Wrong receiver");
-
-        require(
-            _same(saved.productName, "Payment Module"),
-            "Wrong product name"
-        );
-
-        require(_same(saved.version, "1.0.0"), "Wrong version");
-        require(saved.sbomHash == sbomHash, "Wrong SBOM hash");
-        require(saved.fileHash == fileHash, "Wrong file hash");
-
-        require(
-            saved.status == DeliveryRegistry.Status.Pending,
-            "Wrong status"
-        );
-
-        require(saved.submittedAt == block.timestamp, "Wrong submission time");
-        require(saved.reviewedAt == 0, "Should not be reviewed yet");
-
-        require(
-            registry.projectDeliveryCounts(projectId) == 1,
-            "Wrong project delivery count"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectId, 1) == 1,
-            "Wrong stage delivery count"
-        );
-
-        require(
-            registry.getDeliveryId(projectId, 1, 1) == deliveryId,
-            "Wrong delivery lookup"
-        );
-
-        require(
-            registry.getPreviousDeliveryIds(deliveryId).length == 0,
-            "Previous deliveries should be empty"
-        );
-    }
-
-    function test_UnregisteredSupplierCannotSubmit() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        DeliverySupplier supplier = new DeliverySupplier();
-
-        uint256 projectId = registry.createProject("Project A");
-        bool blocked = false;
-
-        try
-            supplier.submit(
-                registry,
-                projectId,
-                address(0x2001),
-                "Payment Module",
-                "1.0.0",
-                keccak256(bytes("sample SBOM")),
-                keccak256(bytes("sample artifact")),
-                new uint256[](0)
-            )
-        returns (uint256) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Route not allowed");
-        }
-
-        require(blocked, "Unregistered supplier should be blocked");
-        require(
-            registry.deliveryCount() == 0,
-            "Delivery count should remain 0"
-        );
-
-        require(
-            registry.projectDeliveryCounts(projectId) == 0,
-            "Project delivery count should remain 0"
-        );
-    }
-
-    function test_NonexistentDeliveryCannotBeRead() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        bool blocked = false;
-
-        try registry.getDelivery(1) returns (DeliveryRegistry.Delivery memory) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Delivery not found");
-        }
-
-        require(blocked, "Nonexistent delivery should not be readable");
-    }
-
-    function test_ReceiverCanReviewDelivery() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 deliveryId
-        ) = _reviewSetup();
-
-        receiver.review(registry, deliveryId, DeliveryRegistry.Status.Approved);
-
-        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
-            deliveryId
-        );
-
-        require(
-            saved.status == DeliveryRegistry.Status.Approved,
-            "Delivery should be approved"
-        );
-
-        require(saved.reviewedAt == block.timestamp, "Wrong review time");
-    }
-
-    function test_ReceiverCanRejectDelivery() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 deliveryId
-        ) = _reviewSetup();
-
-        receiver.review(registry, deliveryId, DeliveryRegistry.Status.Rejected);
-
-        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
-            deliveryId
-        );
-
-        require(
-            saved.status == DeliveryRegistry.Status.Rejected,
-            "Delivery should be rejected"
-        );
-
-        require(saved.reviewedAt == block.timestamp, "Wrong review time");
-    }
-
-    function test_OtherCompanyCannotReviewDelivery() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 deliveryId
-        ) = _reviewSetup();
-
-        DeliveryReceiver other = new DeliveryReceiver();
-        bool blocked = false;
-
-        try
-            other.review(registry, deliveryId, DeliveryRegistry.Status.Approved)
-        {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Only receiver can review");
-        }
-
-        require(blocked, "Other company should not review");
-
-        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
-            deliveryId
-        );
-
-        require(
-            saved.receiver == address(receiver),
-            "Receiver should not change"
-        );
-
-        require(
-            saved.status == DeliveryRegistry.Status.Pending,
-            "Status should remain pending"
-        );
-
-        require(saved.reviewedAt == 0, "Review time should remain 0");
-    }
-
-    function test_ReviewedDeliveryCannotBeReviewedAgain() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 deliveryId
-        ) = _reviewSetup();
-
-        receiver.review(registry, deliveryId, DeliveryRegistry.Status.Approved);
-
-        uint256 reviewedAt = registry.getDelivery(deliveryId).reviewedAt;
-        bool blocked = false;
-
-        try
-            receiver.review(
-                registry,
-                deliveryId,
-                DeliveryRegistry.Status.Rejected
-            )
-        {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Delivery already reviewed");
-        }
-
-        require(blocked, "Repeated review should be blocked");
-
-        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
-            deliveryId
-        );
-
-        require(
-            saved.status == DeliveryRegistry.Status.Approved,
-            "Approved status should remain"
-        );
-
-        require(
-            saved.reviewedAt == reviewedAt,
-            "Review time should not change"
-        );
-    }
-
-    function test_StageNumbersAndPreviousDeliveries() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-
-        uint256 projectId = registry.createProject("Project A");
-
-        DeliverySupplier supplierD = new DeliverySupplier();
-        DeliverySupplier supplierE = new DeliverySupplier();
-        DeliveryReceiver companyC = new DeliveryReceiver();
-        DeliveryReceiver companyB = new DeliveryReceiver();
-
-        registry.allowRoute(
-            projectId,
-            address(supplierD),
-            address(companyC),
-            1
-        );
-
-        registry.allowRoute(
-            projectId,
-            address(supplierE),
-            address(companyC),
-            1
-        );
-
-        registry.allowRoute(projectId, address(companyC), address(companyB), 2);
-
-        uint256 deliveryD = _submit(
-            registry,
-            supplierD,
-            projectId,
-            address(companyC),
-            new uint256[](0)
-        );
-
-        uint256 deliveryE = _submit(
-            registry,
-            supplierE,
-            projectId,
-            address(companyC),
-            new uint256[](0)
-        );
-
-        companyC.review(registry, deliveryD, DeliveryRegistry.Status.Approved);
-
-        companyC.review(registry, deliveryE, DeliveryRegistry.Status.Approved);
-
-        uint256[] memory previousIds = new uint256[](2);
-        previousIds[0] = deliveryD;
-        previousIds[1] = deliveryE;
-
-        uint256 deliveryC = _submit(
-            registry,
-            companyC,
-            projectId,
-            address(companyB),
-            previousIds
-        );
-
-        DeliveryRegistry.Delivery memory saved = registry.getDelivery(
-            deliveryC
-        );
-
-        require(saved.stage == 2, "Wrong stage");
-        require(saved.stageDeliveryNumber == 1, "Stage 2 should start at 1");
-
-        require(
-            registry.getDeliveryId(projectId, 1, 1) == deliveryD,
-            "Wrong P001-1-01 mapping"
-        );
-
-        require(
-            registry.getDeliveryId(projectId, 1, 2) == deliveryE,
-            "Wrong P001-1-02 mapping"
-        );
-
-        require(
-            registry.getDeliveryId(projectId, 2, 1) == deliveryC,
-            "Wrong P001-2-01 mapping"
-        );
-
-        uint256[] memory savedIds = registry.getPreviousDeliveryIds(deliveryC);
-
-        require(savedIds.length == 2, "Wrong previous delivery count");
-        require(savedIds[0] == deliveryD, "Wrong first previous delivery");
-        require(savedIds[1] == deliveryE, "Wrong second previous delivery");
-
-        require(
-            registry.projectDeliveryCounts(projectId) == 3,
-            "Wrong project delivery count"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectId, 1) == 2,
-            "Wrong stage 1 count"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectId, 2) == 1,
-            "Wrong stage 2 count"
-        );
-    }
-
-    function test_ProjectsHaveSeparateRoutesAndNumbers() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        DeliverySupplier supplier = new DeliverySupplier();
-
-        uint256 projectA = registry.createProject("Project A");
-        uint256 projectB = registry.createProject("Project B");
-
-        address receiver = address(0x2001);
-
-        registry.allowRoute(projectA, address(supplier), receiver, 1);
-
-        uint256 deliveryA = _submit(
-            registry,
-            supplier,
-            projectA,
-            receiver,
-            new uint256[](0)
-        );
-
-        bool blocked = false;
-
-        try
-            supplier.submit(
-                registry,
-                projectB,
-                receiver,
-                "Payment Module",
-                "1.0.0",
-                keccak256(bytes("sample SBOM")),
-                keccak256(bytes("sample artifact")),
-                new uint256[](0)
-            )
-        returns (uint256) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Route not allowed");
-        }
-
-        require(blocked, "Project A route must not authorize project B");
-
-        registry.allowRoute(projectB, address(supplier), receiver, 1);
-
-        uint256 deliveryB = _submit(
-            registry,
-            supplier,
-            projectB,
-            receiver,
-            new uint256[](0)
-        );
-
-        require(deliveryA != deliveryB, "Global IDs must be different");
-        require(registry.deliveryCount() == 2, "Wrong global delivery count");
-
-        require(
-            registry.getDeliveryId(projectA, 1, 1) == deliveryA,
-            "Wrong project A lookup"
-        );
-
-        require(
-            registry.getDeliveryId(projectB, 1, 1) == deliveryB,
-            "Wrong project B lookup"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectA, 1) == 1,
-            "Wrong project A sequence"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectB, 1) == 1,
-            "Wrong project B sequence"
-        );
-    }
-
-    function test_PreviousDeliveryFromAnotherProjectCannotBeLinked() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        DeliverySupplier supplier = new DeliverySupplier();
-        DeliveryReceiver companyC = new DeliveryReceiver();
-
-        uint256 projectA = registry.createProject("Project A");
-        uint256 projectB = registry.createProject("Project B");
-
-        address receiver = address(0x3001);
-
-        registry.allowRoute(projectA, address(supplier), address(companyC), 1);
-
-        registry.allowRoute(projectB, address(companyC), receiver, 2);
-
-        uint256 previousId = _submit(
-            registry,
-            supplier,
-            projectA,
-            address(companyC),
-            new uint256[](0)
-        );
-
-        companyC.review(registry, previousId, DeliveryRegistry.Status.Approved);
-
-        uint256[] memory previousIds = new uint256[](1);
-        previousIds[0] = previousId;
-
-        bool blocked = false;
-
-        try
-            companyC.submit(
-                registry,
-                projectB,
-                receiver,
-                "Integrated Module",
-                "1.0.0",
-                keccak256(bytes("integrated SBOM")),
-                keccak256(bytes("integrated artifact")),
-                previousIds
-            )
-        returns (uint256) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(
-                reason,
-                "Previous delivery belongs to another project"
-            );
-        }
-
-        require(blocked, "Cross-project link should be blocked");
-        require(
-            registry.deliveryCount() == 1,
-            "No new delivery should be saved"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectB, 2) == 0,
-            "Failed submission should not consume sequence"
-        );
-    }
-
-    function test_PreviousDeliveryFromSameStageCannotBeLinked() public {
-        DeliveryRegistry registry = new DeliveryRegistry();
-        DeliverySupplier supplier = new DeliverySupplier();
-        DeliveryReceiver companyC = new DeliveryReceiver();
-
-        uint256 projectId = registry.createProject("Project A");
-        address receiver = address(0x3001);
-
-        registry.allowRoute(projectId, address(supplier), address(companyC), 1);
-
-        registry.allowRoute(projectId, address(companyC), receiver, 1);
-
-        uint256 previousId = _submit(
-            registry,
-            supplier,
-            projectId,
-            address(companyC),
-            new uint256[](0)
-        );
-
-        companyC.review(registry, previousId, DeliveryRegistry.Status.Approved);
-
-        uint256[] memory previousIds = new uint256[](1);
-        previousIds[0] = previousId;
-
-        bool blocked = false;
-
-        try
-            companyC.submit(
-                registry,
-                projectId,
-                receiver,
-                "Integrated Module",
-                "1.0.0",
-                keccak256(bytes("integrated SBOM")),
-                keccak256(bytes("integrated artifact")),
-                previousIds
-            )
-        returns (uint256) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(
-                reason,
-                "Previous delivery must be from an earlier stage"
-            );
-        }
-
-        require(blocked, "Same-stage link should be blocked");
-        require(
-            registry.deliveryCount() == 1,
-            "No new delivery should be saved"
-        );
-
-        require(
-            registry.stageDeliveryCounts(projectId, 1) == 1,
-            "Failed submission should not consume sequence"
-        );
-    }
-    function test_SupplierCanResubmitRejectedDelivery() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 originalId
-        ) = _reviewSetup();
-
-        receiver.review(registry, originalId, DeliveryRegistry.Status.Rejected);
-
-        DeliveryRegistry.Delivery memory original = registry.getDelivery(
-            originalId
-        );
-
-        DeliverySupplier supplier = DeliverySupplier(original.supplier);
-
-        bytes32 newSbomHash = keccak256(bytes("revised SBOM"));
-        bytes32 newFileHash = keccak256(bytes("revised artifact"));
-
-        uint256 newId = supplier.resubmit(
-            registry,
-            originalId,
-            "1.0.1",
-            newSbomHash,
-            newFileHash,
-            new uint256[](0)
-        );
-
-        DeliveryRegistry.Delivery memory revised = registry.getDelivery(newId);
-
-        require(newId != originalId, "New delivery ID required");
-        require(registry.deliveryCount() == 2, "Wrong delivery count");
-
-        require(
-            revised.projectId == original.projectId,
-            "Project should remain the same"
-        );
-
-        require(
-            revised.stage == original.stage,
-            "Stage should remain the same"
-        );
-
-        require(revised.stageDeliveryNumber == 2, "Wrong revision sequence");
-
-        require(
-            revised.supplier == original.supplier,
-            "Supplier should remain the same"
-        );
-
-        require(
-            revised.receiver == original.receiver,
-            "Receiver should remain the same"
-        );
-
-        require(
-            _same(revised.productName, original.productName),
-            "Product name should remain the same"
-        );
-
-        require(_same(revised.version, "1.0.1"), "Wrong revised version");
-        require(revised.sbomHash == newSbomHash, "Wrong revised SBOM hash");
-        require(revised.fileHash == newFileHash, "Wrong revised file hash");
-
-        require(
-            revised.status == DeliveryRegistry.Status.Pending,
-            "Revision should start pending"
-        );
-
-        require(revised.reviewedAt == 0, "Revision should not be reviewed");
-
-        require(
-            revised.submittedAt == block.timestamp,
-            "Wrong revision submission time"
-        );
-
-        require(
-            registry.replacesDeliveryIds(newId) == originalId,
-            "Missing link to original delivery"
-        );
-
-        require(
-            registry.resubmittedDeliveryIds(originalId) == newId,
-            "Missing link to revised delivery"
-        );
-
-        require(
-            registry.getDeliveryId(
-                revised.projectId,
-                revised.stage,
-                revised.stageDeliveryNumber
-            ) == newId,
-            "Wrong revision number lookup"
-        );
-
-        DeliveryRegistry.Delivery memory unchanged = registry.getDelivery(
-            originalId
-        );
-
-        require(
-            keccak256(abi.encode(unchanged)) == keccak256(abi.encode(original)),
-            "Original delivery must remain unchanged"
-        );
-
-        receiver.review(registry, newId, DeliveryRegistry.Status.Approved);
-
-        require(
-            registry.getDelivery(newId).status ==
-                DeliveryRegistry.Status.Approved,
-            "Receiver should be able to approve revision"
-        );
-    }
-
-    function test_OtherSupplierCannotResubmitDelivery() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 originalId
-        ) = _reviewSetup();
-
-        receiver.review(registry, originalId, DeliveryRegistry.Status.Rejected);
-
-        DeliverySupplier other = new DeliverySupplier();
-
-        uint256 projectId = registry.getDelivery(originalId).projectId;
-
-        registry.allowRoute(projectId, address(other), address(receiver), 1);
-
-        bool blocked = false;
-
-        try
-            other.resubmit(
-                registry,
-                originalId,
-                "1.0.1",
-                keccak256(bytes("revised SBOM")),
-                keccak256(bytes("revised artifact")),
-                new uint256[](0)
-            )
-        returns (uint256) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Only original supplier can resubmit");
-        }
-
-        require(blocked, "Other supplier should be blocked");
-        require(registry.deliveryCount() == 1, "No revision should be created");
-
-        require(
-            registry.resubmittedDeliveryIds(originalId) == 0,
-            "No revision link should be saved"
-        );
-    }
-
-    function test_PendingOrApprovedDeliveryCannotBeResubmitted() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 originalId
-        ) = _reviewSetup();
-
-        DeliverySupplier supplier = DeliverySupplier(
-            registry.getDelivery(originalId).supplier
-        );
-
-        bool pendingBlocked = false;
-
-        try
-            supplier.resubmit(
-                registry,
-                originalId,
-                "1.0.1",
-                keccak256(bytes("revised SBOM")),
-                keccak256(bytes("revised artifact")),
-                new uint256[](0)
-            )
-        returns (uint256) {
-            pendingBlocked = false;
-        } catch Error(string memory reason) {
-            pendingBlocked = _same(
-                reason,
-                "Only rejected delivery can be resubmitted"
-            );
-        }
-
-        require(pendingBlocked, "Pending delivery should be blocked");
-
-        receiver.review(registry, originalId, DeliveryRegistry.Status.Approved);
-
-        bool approvedBlocked = false;
-
-        try
-            supplier.resubmit(
-                registry,
-                originalId,
-                "1.0.1",
-                keccak256(bytes("revised SBOM")),
-                keccak256(bytes("revised artifact")),
-                new uint256[](0)
-            )
-        returns (uint256) {
-            approvedBlocked = false;
-        } catch Error(string memory reason) {
-            approvedBlocked = _same(
-                reason,
-                "Only rejected delivery can be resubmitted"
-            );
-        }
-
-        require(approvedBlocked, "Approved delivery should be blocked");
-        require(registry.deliveryCount() == 1, "No revision should be created");
-
-        require(
-            registry.resubmittedDeliveryIds(originalId) == 0,
-            "No revision link should be saved"
-        );
-
-        require(
-            registry.getDelivery(originalId).status ==
-                DeliveryRegistry.Status.Approved,
-            "Original status should remain approved"
-        );
-    }
-
-    function test_SameDeliveryCannotBeResubmittedTwice() public {
-        (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 originalId
-        ) = _reviewSetup();
-
-        receiver.review(registry, originalId, DeliveryRegistry.Status.Rejected);
-
-        DeliverySupplier supplier = DeliverySupplier(
-            registry.getDelivery(originalId).supplier
-        );
-
-        uint256 newId = supplier.resubmit(
-            registry,
-            originalId,
-            "1.0.1",
-            keccak256(bytes("revised SBOM")),
-            keccak256(bytes("revised artifact")),
-            new uint256[](0)
-        );
-
-        bool blocked = false;
-
-        try
-            supplier.resubmit(
-                registry,
-                originalId,
-                "1.0.2",
-                keccak256(bytes("another SBOM")),
-                keccak256(bytes("another artifact")),
-                new uint256[](0)
-            )
-        returns (uint256) {
-            blocked = false;
-        } catch Error(string memory reason) {
-            blocked = _same(reason, "Delivery already resubmitted");
-        }
-
-        require(blocked, "Duplicate resubmission should be blocked");
-        require(
-            registry.deliveryCount() == 2,
-            "No extra revision should be created"
-        );
-
-        require(
-            registry.resubmittedDeliveryIds(originalId) == newId,
-            "Existing revision link should remain"
-        );
-
-        require(
-            registry.replacesDeliveryIds(newId) == originalId,
-            "Existing original link should remain"
-        );
-    }
-
-    function _reviewSetup()
-        private
-        returns (
-            DeliveryRegistry registry,
-            DeliveryReceiver receiver,
-            uint256 deliveryId
-        )
-    {
+contract DeliveryRegistryTest is Test {
+    DeliveryRegistry registry;
+    address a = address(0xA);
+    address b = address(0xB);
+    address c = address(0xC);
+    address d = address(0xD);
+    address e = address(0xE);
+    address outsider = address(0xF);
+    uint256 project;
+    bytes32 sbom = keccak256("SBOM");
+    bytes32 artifact = keccak256("artifact");
+
+    event CompanyRegistered(address indexed company);
+    event ProjectCreated(uint256 indexed projectId, string name, address indexed customer);
+    event RouteAllowed(uint256 indexed projectId, address indexed supplier, address indexed receiver, uint256 stage);
+
+    function setUp() public {
         registry = new DeliveryRegistry();
-
-        DeliverySupplier supplier = new DeliverySupplier();
-        receiver = new DeliveryReceiver();
-
-        uint256 projectId = registry.createProject("Project A");
-
-        registry.allowRoute(projectId, address(supplier), address(receiver), 1);
-
-        deliveryId = _submit(
-            registry,
-            supplier,
-            projectId,
-            address(receiver),
-            new uint256[](0)
-        );
+        registry.registerCompany(a);
+        registry.registerCompany(b);
+        registry.registerCompany(c);
+        registry.registerCompany(d);
+        registry.registerCompany(e);
+        registry.registerCompany(outsider);
+        vm.prank(a);
+        project = registry.createProject("Project A");
+        _add(a, b, project);
+        _add(b, c, project);
+        _add(c, d, project);
+        _add(c, e, project);
     }
 
-    function _submit(
-        DeliveryRegistry registry,
-        DeliverySupplier supplier,
-        uint256 projectId,
-        address receiver,
-        uint256[] memory previousIds
-    ) private returns (uint256) {
-        return
-            supplier.submit(
-                registry,
-                projectId,
-                receiver,
-                "Payment Module",
-                "1.0.0",
-                keccak256(bytes("sample SBOM")),
-                keccak256(bytes("sample artifact")),
-                previousIds
-            );
+    function test_OnlyAdminRegistersCompanies() public {
+        vm.prank(a);
+        vm.expectRevert(bytes("Only admin"));
+        registry.registerCompany(address(99));
+        vm.expectRevert(bytes("Invalid address"));
+        registry.registerCompany(address(0));
+        vm.expectRevert(bytes("Company already registered"));
+        registry.registerCompany(a);
+        vm.expectEmit(true, false, false, true);
+        emit CompanyRegistered(address(99));
+        registry.registerCompany(address(99));
+        assertTrue(registry.registeredCompanies(address(99)));
     }
 
-    function _same(
-        string memory left,
-        string memory right
-    ) private pure returns (bool) {
-        return keccak256(bytes(left)) == keccak256(bytes(right));
+    function test_RegisteredCompanyCreatesProjectAsCustomer() public {
+        vm.expectEmit(true, true, false, true);
+        emit ProjectCreated(2, "Project B", b);
+        vm.prank(b);
+        uint256 id = registry.createProject("Project B");
+        (string memory name, address customer, uint256 createdAt) = registry.projects(id);
+        assertEq(name, "Project B");
+        assertEq(customer, b);
+        assertEq(createdAt, block.timestamp);
+        assertTrue(registry.projectMembers(id, b));
+        assertEq(registry.companyDepths(id, b), 0);
+        assertEq(registry.parentCompanies(id, b), address(0));
+    }
+
+    function test_ProjectCreationRejectsUnknownCompanyAndEmptyName() public {
+        vm.expectRevert(bytes("Company not registered"));
+        registry.createProject("Unregistered admin");
+        vm.prank(a);
+        vm.expectRevert(bytes("Project name required"));
+        registry.createProject("");
+        assertEq(registry.projectCount(), 1);
+    }
+
+    function test_DelegatedTreeHasAutomaticDepthAndFixedReceiver() public view {
+        assertEq(registry.parentCompanies(project, b), a);
+        assertEq(registry.parentCompanies(project, c), b);
+        assertEq(registry.parentCompanies(project, d), c);
+        assertEq(registry.parentCompanies(project, e), c);
+        assertEq(registry.companyDepths(project, a), 0);
+        assertEq(registry.companyDepths(project, b), 1);
+        assertEq(registry.companyDepths(project, c), 2);
+        assertEq(registry.companyDepths(project, d), 3);
+        assertEq(registry.routeStages(project, d, c), 3);
+        assertTrue(registry.allowedRoutes(project, d, c));
+        assertFalse(registry.allowedRoutes(project, d, b));
+    }
+
+    function test_AddSupplierEmitsRouteAndPreservesExistingDepths() public {
+        vm.expectEmit(true, true, true, true);
+        emit RouteAllowed(project, outsider, d, 4);
+        _add(d, outsider, project);
+        assertEq(registry.companyDepths(project, outsider), 4);
+        assertEq(registry.companyDepths(project, b), 1);
+        assertEq(registry.companyDepths(project, d), 3);
+    }
+
+    function test_NonmemberAndAdminCannotSetProjectRoutes() public {
+        vm.prank(outsider);
+        vm.expectRevert(bytes("Not a project member"));
+        registry.addSupplier(project, address(99));
+        vm.expectRevert(bytes("Not a project member"));
+        registry.addSupplier(project, outsider);
+    }
+
+    function test_RejectsUnknownProjectAndSupplier() public {
+        vm.prank(a);
+        vm.expectRevert(bytes("Project not found"));
+        registry.addSupplier(0, outsider);
+        vm.prank(a);
+        vm.expectRevert(bytes("Project not found"));
+        registry.addSupplier(2, outsider);
+        vm.prank(a);
+        vm.expectRevert(bytes("Company not registered"));
+        registry.addSupplier(project, address(99));
+        vm.prank(a);
+        vm.expectRevert(bytes("Company not registered"));
+        registry.addSupplier(project, address(0));
+    }
+
+    function test_RejectsSelfDuplicateMultipleParentsAndCycles() public {
+        vm.prank(c);
+        vm.expectRevert(bytes("Supplier and receiver cannot be the same"));
+        registry.addSupplier(project, c);
+        vm.prank(c);
+        vm.expectRevert(bytes("Company already in project"));
+        registry.addSupplier(project, d);
+        vm.prank(b);
+        vm.expectRevert(bytes("Company already in project"));
+        registry.addSupplier(project, d);
+        vm.prank(d);
+        vm.expectRevert(bytes("Company already in project"));
+        registry.addSupplier(project, a);
+        vm.prank(d);
+        vm.expectRevert(bytes("Company already in project"));
+        registry.addSupplier(project, b);
+        assertEq(registry.parentCompanies(project, d), c);
+    }
+
+    function test_ProjectsHaveSeparateMembershipRoutesAndNumbers() public {
+        vm.prank(e);
+        uint256 second = registry.createProject("Project B");
+        vm.prank(a);
+        vm.expectRevert(bytes("Not a project member"));
+        registry.addSupplier(second, b);
+        _add(e, d, second);
+        assertEq(registry.parentCompanies(second, d), e);
+        assertEq(registry.parentCompanies(project, d), c);
+        uint256 firstId = _submit(d, c, project, new uint256[](0));
+        uint256 secondId = _submit(d, e, second, new uint256[](0));
+        assertEq(registry.getDeliveryId(project, 3, 1), firstId);
+        assertEq(registry.getDeliveryId(second, 1, 1), secondId);
+        assertEq(registry.projectDeliveryCounts(project), 1);
+        assertEq(registry.projectDeliveryCounts(second), 1);
+        vm.prank(d);
+        vm.expectRevert(bytes("Route not allowed"));
+        registry.submitDelivery(second, c, "Product", "1", sbom, artifact, new uint256[](0));
+    }
+
+    function test_FullSupplyChainAndProjectNumbering() public {
+        uint256 did = _submit(d, c, project, new uint256[](0));
+        uint256 eid = _submit(e, c, project, new uint256[](0));
+        _review(c, did, DeliveryRegistry.Status.Approved);
+        _review(c, eid, DeliveryRegistry.Status.Approved);
+        uint256[] memory sources = new uint256[](2);
+        sources[0] = did;
+        sources[1] = eid;
+        uint256 cid = _submit(c, b, project, sources);
+        _review(b, cid, DeliveryRegistry.Status.Approved);
+        uint256 bid = _submit(b, a, project, _one(cid));
+        _review(a, bid, DeliveryRegistry.Status.Approved);
+        assertEq(registry.getPreviousDeliveryIds(cid), sources);
+        assertEq(registry.getPreviousDeliveryIds(bid), _one(cid));
+        assertEq(registry.getDeliveryId(project, 3, 1), did);
+        assertEq(registry.getDeliveryId(project, 3, 2), eid);
+        assertEq(registry.getDeliveryId(project, 2, 1), cid);
+        assertEq(registry.getDeliveryId(project, 1, 1), bid);
+        assertEq(registry.projectDeliveryCounts(project), 4);
+        DeliveryRegistry.Delivery memory saved = registry.getDelivery(did);
+        assertEq(saved.supplier, d);
+        assertEq(saved.receiver, c);
+        assertEq(saved.projectId, project);
+        assertEq(saved.productName, "Product");
+        assertEq(saved.version, "1");
+        assertEq(saved.sbomHash, sbom);
+        assertEq(saved.fileHash, artifact);
+        assertEq(saved.submittedAt, block.timestamp);
+        assertEq(uint256(saved.status), uint256(DeliveryRegistry.Status.Approved));
+    }
+
+    function test_OnlyDirectSupplierCanSubmit() public {
+        vm.prank(d);
+        vm.expectRevert(bytes("Route not allowed"));
+        registry.submitDelivery(project, b, "Product", "1", sbom, artifact, new uint256[](0));
+        vm.prank(outsider);
+        vm.expectRevert(bytes("Route not allowed"));
+        registry.submitDelivery(project, c, "Product", "1", sbom, artifact, new uint256[](0));
+        assertEq(registry.deliveryCount(), 0);
+    }
+
+    function test_AdminAndCustomerCannotReviewOthersDeliveries() public {
+        uint256 id = _submit(d, c, project, new uint256[](0));
+        vm.expectRevert(bytes("Only receiver can review"));
+        registry.reviewDelivery(id, DeliveryRegistry.Status.Approved);
+        vm.prank(a);
+        vm.expectRevert(bytes("Only receiver can review"));
+        registry.reviewDelivery(id, DeliveryRegistry.Status.Approved);
+        vm.prank(d);
+        vm.expectRevert(bytes("Only receiver can review"));
+        registry.reviewDelivery(id, DeliveryRegistry.Status.Approved);
+        assertEq(uint256(registry.getDelivery(id).status), uint256(DeliveryRegistry.Status.Pending));
+        assertEq(registry.getDelivery(id).reviewedAt, 0);
+        vm.warp(block.timestamp + 10);
+        _review(c, id, DeliveryRegistry.Status.Rejected);
+        assertEq(registry.getDelivery(id).reviewedAt, block.timestamp);
+        vm.prank(c);
+        vm.expectRevert(bytes("Delivery already reviewed"));
+        registry.reviewDelivery(id, DeliveryRegistry.Status.Approved);
+    }
+
+    function test_InvalidReviewStatusIsBlocked() public {
+        uint256 id = _submit(d, c, project, new uint256[](0));
+        vm.prank(c);
+        vm.expectRevert(bytes("Invalid review status"));
+        registry.reviewDelivery(id, DeliveryRegistry.Status.Pending);
+    }
+
+    function test_PendingRejectedAndDuplicateLinksAreBlocked() public {
+        uint256 id = _submit(d, c, project, new uint256[](0));
+        _expectBadLink(_one(id), "Previous delivery not approved");
+        _review(c, id, DeliveryRegistry.Status.Rejected);
+        _expectBadLink(_one(id), "Previous delivery not approved");
+        uint256 approved = _submit(e, c, project, new uint256[](0));
+        _review(c, approved, DeliveryRegistry.Status.Approved);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = approved;
+        ids[1] = approved;
+        _expectBadLink(ids, "Duplicate previous delivery");
+        assertEq(registry.deliveryCount(), 2);
+        assertEq(registry.stageDeliveryCounts(project, 2), 0);
+    }
+
+    function test_CrossProjectAndUnreceivedLinksAreBlocked() public {
+        vm.prank(c);
+        uint256 second = registry.createProject("Other");
+        _add(c, d, second);
+        uint256 id = _submit(d, c, second, new uint256[](0));
+        _review(c, id, DeliveryRegistry.Status.Approved);
+        _expectBadLink(_one(id), "Previous delivery belongs to another project");
+        id = _submit(b, a, project, new uint256[](0));
+        _review(a, id, DeliveryRegistry.Status.Approved);
+        _expectBadLink(_one(id), "Previous delivery was not received by supplier");
+        _expectBadLink(_one(999), "Delivery not found");
+    }
+
+    function test_ResubmissionPreservesOriginalAndCanRepeatAfterRejection() public {
+        uint256 id = _submit(d, c, project, new uint256[](0));
+        _review(c, id, DeliveryRegistry.Status.Rejected);
+        bytes32 original = keccak256(abi.encode(registry.getDelivery(id)));
+        vm.prank(d);
+        uint256 revised = registry.resubmitDelivery(id, "2", keccak256("new SBOM"), keccak256("new artifact"), new uint256[](0));
+        assertEq(keccak256(abi.encode(registry.getDelivery(id))), original);
+        assertEq(registry.replacesDeliveryIds(revised), id);
+        assertEq(registry.resubmittedDeliveryIds(id), revised);
+        DeliveryRegistry.Delivery memory saved = registry.getDelivery(revised);
+        assertEq(saved.version, "2");
+        assertEq(saved.sbomHash, keccak256("new SBOM"));
+        assertEq(saved.fileHash, keccak256("new artifact"));
+        assertEq(saved.supplier, d);
+        assertEq(saved.receiver, c);
+        assertEq(saved.projectId, project);
+        assertEq(saved.stage, 3);
+        assertEq(saved.stageDeliveryNumber, 2);
+        assertEq(uint256(saved.status), uint256(DeliveryRegistry.Status.Pending));
+        assertEq(saved.reviewedAt, 0);
+        vm.prank(d);
+        vm.expectRevert(bytes("Delivery already resubmitted"));
+        registry.resubmitDelivery(id, "3", sbom, artifact, new uint256[](0));
+        _review(c, revised, DeliveryRegistry.Status.Rejected);
+        vm.prank(d);
+        uint256 third = registry.resubmitDelivery(revised, "3", sbom, artifact, new uint256[](0));
+        _review(c, third, DeliveryRegistry.Status.Approved);
+        assertEq(registry.replacesDeliveryIds(third), revised);
+        assertEq(registry.resubmittedDeliveryIds(revised), third);
+    }
+
+    function test_ResubmissionRequiresOriginalSupplierAndRejection() public {
+        uint256 id = _submit(d, c, project, new uint256[](0));
+        vm.prank(d);
+        vm.expectRevert(bytes("Only rejected delivery can be resubmitted"));
+        registry.resubmitDelivery(id, "2", sbom, artifact, new uint256[](0));
+        _review(c, id, DeliveryRegistry.Status.Approved);
+        vm.prank(d);
+        vm.expectRevert(bytes("Only rejected delivery can be resubmitted"));
+        registry.resubmitDelivery(id, "2", sbom, artifact, new uint256[](0));
+        uint256 rejected = _submit(d, c, project, new uint256[](0));
+        _review(c, rejected, DeliveryRegistry.Status.Rejected);
+        vm.prank(e);
+        vm.expectRevert(bytes("Only original supplier can resubmit"));
+        registry.resubmitDelivery(rejected, "2", sbom, artifact, new uint256[](0));
+        assertEq(registry.resubmittedDeliveryIds(rejected), 0);
+    }
+
+    function test_NonexistentRecordsAreRejected() public {
+        vm.expectRevert(bytes("Delivery not found"));
+        registry.getDelivery(0);
+        vm.expectRevert(bytes("Delivery not found"));
+        registry.getPreviousDeliveryIds(1);
+        vm.expectRevert(bytes("Delivery not found"));
+        registry.getDeliveryId(project, 1, 1);
+    }
+
+    function test_EmptySubmissionFieldsAreRejected() public {
+        vm.startPrank(d);
+        vm.expectRevert(bytes("Product name required"));
+        registry.submitDelivery(project, c, "", "1", sbom, artifact, new uint256[](0));
+        vm.expectRevert(bytes("Version required"));
+        registry.submitDelivery(project, c, "Product", "", sbom, artifact, new uint256[](0));
+        vm.expectRevert(bytes("SBOM hash required"));
+        registry.submitDelivery(project, c, "Product", "1", bytes32(0), artifact, new uint256[](0));
+        vm.expectRevert(bytes("File hash required"));
+        registry.submitDelivery(project, c, "Product", "1", sbom, bytes32(0), new uint256[](0));
+        vm.stopPrank();
+        assertEq(registry.deliveryCount(), 0);
+    }
+
+    function _add(address receiver, address supplier, uint256 id) private {
+        vm.prank(receiver);
+        registry.addSupplier(id, supplier);
+    }
+
+    function _submit(address supplier, address receiver, uint256 id, uint256[] memory previous) private returns (uint256) {
+        vm.prank(supplier);
+        return registry.submitDelivery(id, receiver, "Product", "1", sbom, artifact, previous);
+    }
+
+    function _review(address receiver, uint256 id, DeliveryRegistry.Status status) private {
+        vm.prank(receiver);
+        registry.reviewDelivery(id, status);
+    }
+
+    function _one(uint256 id) private pure returns (uint256[] memory ids) {
+        ids = new uint256[](1);
+        ids[0] = id;
+    }
+
+    function _expectBadLink(uint256[] memory ids, string memory reason) private {
+        vm.prank(c);
+        vm.expectRevert(bytes(reason));
+        registry.submitDelivery(project, b, "Product", "1", sbom, artifact, ids);
     }
 }

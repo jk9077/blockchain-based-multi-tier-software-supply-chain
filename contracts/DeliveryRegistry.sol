@@ -9,11 +9,13 @@ contract DeliveryRegistry {
 
     struct Project {
         string name;
+        address customer;
         uint256 createdAt;
     }
 
     struct Delivery {
         uint256 projectId;
+        // Supplier depth from the customer, not chronological delivery order.
         uint256 stage;
         uint256 stageDeliveryNumber;
         address supplier;
@@ -28,6 +30,12 @@ contract DeliveryRegistry {
     }
 
     address public immutable admin;
+
+    mapping(address => bool) public registeredCompanies;
+    mapping(uint256 => mapping(address => bool)) public projectMembers;
+    mapping(uint256 => mapping(address => address)) public parentCompanies;
+    // Customer depth is 0; its direct suppliers have depth 1.
+    mapping(uint256 => mapping(address => uint256)) public companyDepths;
 
     uint256 public projectCount;
     uint256 public deliveryCount;
@@ -53,7 +61,12 @@ contract DeliveryRegistry {
     mapping(uint256 => uint256) public replacesDeliveryIds;
     mapping(uint256 => uint256) public resubmittedDeliveryIds;
 
-    event ProjectCreated(uint256 indexed projectId, string name);
+    event CompanyRegistered(address indexed company);
+    event ProjectCreated(
+        uint256 indexed projectId,
+        string name,
+        address indexed customer
+    );
 
     event RouteAllowed(
         uint256 indexed projectId,
@@ -90,47 +103,52 @@ contract DeliveryRegistry {
         admin = msg.sender;
     }
 
-    function createProject(string calldata name) external returns (uint256) {
+    function registerCompany(address company) external {
         require(msg.sender == admin, "Only admin");
+        require(company != address(0), "Invalid address");
+        require(!registeredCompanies[company], "Company already registered");
+        registeredCompanies[company] = true;
+        emit CompanyRegistered(company);
+    }
+
+    function createProject(string calldata name) external returns (uint256) {
+        require(registeredCompanies[msg.sender], "Company not registered");
         require(bytes(name).length > 0, "Project name required");
 
         projectCount++;
 
         uint256 projectId = projectCount;
 
-        projects[projectId] = Project({name: name, createdAt: block.timestamp});
+        projects[projectId] = Project({
+            name: name,
+            customer: msg.sender,
+            createdAt: block.timestamp
+        });
+        projectMembers[projectId][msg.sender] = true;
 
-        emit ProjectCreated(projectId, name);
+        emit ProjectCreated(projectId, name, msg.sender);
 
         return projectId;
     }
 
-    function allowRoute(
+    function addSupplier(
         uint256 projectId,
-        address supplier,
-        address receiver,
-        uint256 stage
+        address supplier
     ) external {
-        require(msg.sender == admin, "Only admin");
-
         _requireProject(projectId);
-
+        require(projectMembers[projectId][msg.sender], "Not a project member");
+        require(registeredCompanies[supplier], "Company not registered");
         require(
-            supplier != address(0) && receiver != address(0),
-            "Invalid address"
-        );
-
-        require(
-            supplier != receiver,
+            supplier != msg.sender,
             "Supplier and receiver cannot be the same"
         );
-
-        require(stage > 0, "Invalid stage");
-
-        require(
-            !allowedRoutes[projectId][supplier][receiver],
-            "Route already allowed"
-        );
+        // Adding only new members prevents cycles and multiple parents.
+        require(!projectMembers[projectId][supplier], "Company already in project");
+        address receiver = msg.sender;
+        uint256 stage = companyDepths[projectId][receiver] + 1;
+        projectMembers[projectId][supplier] = true;
+        parentCompanies[projectId][supplier] = receiver;
+        companyDepths[projectId][supplier] = stage;
 
         allowedRoutes[projectId][supplier][receiver] = true;
         routeStages[projectId][supplier][receiver] = stage;
@@ -281,8 +299,8 @@ contract DeliveryRegistry {
             );
 
             require(
-                previous.stage < stage,
-                "Previous delivery must be from an earlier stage"
+                previous.stage == stage + 1,
+                "Previous delivery must be from a direct supplier"
             );
 
             for (uint256 j = 0; j < i; j++) {
