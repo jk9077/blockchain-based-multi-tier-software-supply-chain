@@ -1,6 +1,122 @@
 pragma solidity ^0.8.28;
 
 contract DeliveryRegistry {
+    error OnlyReceiverCanReview();
+    error DeliveryAlreadyReviewed();
+    error RequiredProductNameMissing();
+    error InvalidReviewStatus();
+    error DuplicateRequirement();
+    error RejectionReasonRequired();
+    error ReviewNoteTooLong();
+    uint256 public constant MAX_REVIEW_NOTE_BYTES = 1024;
+    mapping(uint256 => string) public reviewNotes;
+    error ChecklistAlreadyFinalized();
+    error ChecklistNotProposed();
+    error ChecklistRevisionChanged();
+    error ChecklistNotFinalized();
+    error ChecklistRevisionNotFound();
+    error NoUpstreamReceiver();
+    struct Requirement {
+        address supplier;
+        string productName;
+    }
+
+    struct Checklist {
+        uint256 revision;
+        bool finalized;
+        Requirement[] requirements;
+    }
+
+    // Exact product names identify deliverables within a project's supplier route.
+    mapping(bytes32 => uint256) public checklistRevisions;
+    mapping(bytes32 => mapping(uint256 => Checklist)) private checklists;
+    mapping(uint256 => uint256) public deliveryChecklistRevisions;
+    event ChecklistProposed(bytes32 indexed key, uint256 revision);
+    event ChecklistFinalized(bytes32 indexed key, uint256 revision, address indexed supplier);
+
+    function checklistKey(uint256 projectId, address supplier, string memory productName)
+        public pure returns (bytes32)
+    {
+        return keccak256(abi.encode(projectId, supplier, productName));
+    }
+
+    function getChecklist(uint256 projectId, address supplier, string calldata productName)
+        external view returns (Checklist memory)
+    {
+        bytes32 key = checklistKey(projectId, supplier, productName);
+        return checklists[key][checklistRevisions[key]];
+    }
+
+    // Each proposal creates a new revision. Earlier revisions are never overwritten.
+    function proposeChecklist(uint256 projectId, string calldata productName, Requirement[] calldata items)
+        external
+    {
+        _requireProject(projectId);
+        if (!(parentCompanies[projectId][msg.sender] != address(0))) revert NoUpstreamReceiver();
+        require(bytes(productName).length > 0, "Product name required");
+        bytes32 key = checklistKey(projectId, msg.sender, productName);
+        uint256 revision = checklistRevisions[key] + 1;
+        Checklist storage list = checklists[key][revision];
+        for (uint256 i = 0; i < items.length; i++) {
+            require(allowedRoutes[projectId][items[i].supplier][msg.sender], "Requirement must be a direct supplier");
+            if (!(bytes(items[i].productName).length > 0)) revert RequiredProductNameMissing();
+            for (uint256 j = 0; j < i; j++) {
+                if (!(items[j].supplier != items[i].supplier ||
+                    keccak256(bytes(items[j].productName)) != keccak256(bytes(items[i].productName)))) revert DuplicateRequirement();
+            }
+        }
+        for (uint256 i = 0; i < items.length; i++) {
+            list.requirements.push(items[i]);
+        }
+        list.revision = revision;
+        checklistRevisions[key] = revision;
+        emit ChecklistProposed(key, list.revision);
+    }
+
+    function getChecklistRevision(uint256 projectId, address supplier, string calldata productName, uint256 revision)
+        external view returns (Checklist memory)
+    {
+        bytes32 key = checklistKey(projectId, supplier, productName);
+        if (!(revision > 0 && revision <= checklistRevisions[key])) revert ChecklistRevisionNotFound();
+        return checklists[key][revision];
+    }
+
+    function finalizeChecklist(uint256 projectId, string calldata productName, uint256 expectedRevision)
+        external
+    {
+        _requireProject(projectId);
+        if (!(parentCompanies[projectId][msg.sender] != address(0))) revert NoUpstreamReceiver();
+        bytes32 key = checklistKey(projectId, msg.sender, productName);
+        uint256 revision = checklistRevisions[key];
+        if (!(revision > 0)) revert ChecklistNotProposed();
+        if (!(revision == expectedRevision)) revert ChecklistRevisionChanged();
+        Checklist storage list = checklists[key][revision];
+        if (!(!list.finalized)) revert ChecklistAlreadyFinalized();
+        list.finalized = true;
+        emit ChecklistFinalized(key, revision, msg.sender);
+    }
+
+    function _validateChecklist(uint256 projectId, string memory productName, uint256[] calldata previousIds)
+        private view
+    {
+        bytes32 key = checklistKey(projectId, msg.sender, productName);
+        Checklist storage list = checklists[key][checklistRevisions[key]];
+        if (!(list.finalized)) revert ChecklistNotFinalized();
+        for (uint256 i = 0; i < list.requirements.length; i++) {
+            Requirement storage item = list.requirements[i];
+            bool found;
+            for (uint256 j = 0; j < previousIds.length; j++) {
+                Delivery storage previous = deliveries[previousIds[j]];
+                if (previous.supplier == item.supplier &&
+                    keccak256(bytes(previous.productName)) == keccak256(bytes(item.productName))) {
+                    found = true;
+                    break;
+                }
+            }
+            require(found, "Required delivery missing");
+        }
+    }
+
     enum Status {
         Pending,
         Approved,
@@ -90,7 +206,8 @@ contract DeliveryRegistry {
         uint256 stage,
         uint256 stageDeliveryNumber,
         address indexed reviewer,
-        Status status
+        Status status,
+        string note
     );
 
     event DeliveryResubmitted(
@@ -182,6 +299,7 @@ contract DeliveryRegistry {
             routeStages[projectId][msg.sender][receiver],
             previousIds
         );
+        _validateChecklist(projectId, productName, previousIds);
 
         deliveryCount++;
 
@@ -214,20 +332,31 @@ contract DeliveryRegistry {
         return deliveryId;
     }
 
-    function reviewDelivery(uint256 deliveryId, Status status) external {
+    function reviewDelivery(uint256 deliveryId, Status status, string calldata note) external {
         _requireDelivery(deliveryId);
 
         Delivery storage delivery = deliveries[deliveryId];
 
-        require(msg.sender == delivery.receiver, "Only receiver can review");
+        if (!(msg.sender == delivery.receiver)) revert OnlyReceiverCanReview();
 
-        require(delivery.status == Status.Pending, "Delivery already reviewed");
+        if (!(delivery.status == Status.Pending)) revert DeliveryAlreadyReviewed();
 
-        require(
-            status == Status.Approved || status == Status.Rejected,
-            "Invalid review status"
-        );
+        if (!(
+            status == Status.Approved || status == Status.Rejected)) revert InvalidReviewStatus();
 
+        bytes memory noteBytes = bytes(note);
+        if (noteBytes.length > MAX_REVIEW_NOTE_BYTES) revert ReviewNoteTooLong();
+        if (status == Status.Rejected) {
+            bool hasContent;
+            for (uint256 i = 0; i < noteBytes.length; i++) {
+                if (uint8(noteBytes[i]) > 32) {
+                    hasContent = true;
+                    break;
+                }
+            }
+            if (!hasContent) revert RejectionReasonRequired();
+        }
+        reviewNotes[deliveryId] = note;
         delivery.status = status;
         delivery.reviewedAt = block.timestamp;
 
@@ -237,7 +366,8 @@ contract DeliveryRegistry {
             delivery.stage,
             delivery.stageDeliveryNumber,
             msg.sender,
-            status
+            status,
+            note
         );
     }
 
@@ -319,6 +449,9 @@ contract DeliveryRegistry {
         Delivery storage delivery = deliveries[deliveryId];
 
         previousDeliveryIds[deliveryId] = previousIds;
+        deliveryChecklistRevisions[deliveryId] = checklistRevisions[
+            checklistKey(delivery.projectId, delivery.supplier, delivery.productName)
+        ];
 
         deliveryIdsByProject[delivery.projectId][delivery.stage][
             delivery.stageDeliveryNumber
