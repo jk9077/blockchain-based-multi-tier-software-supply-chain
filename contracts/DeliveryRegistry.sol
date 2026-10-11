@@ -1,119 +1,170 @@
+//SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
 contract DeliveryRegistry {
+    error CompanyAlreadyInProject();
+    error DeliveryAlreadyResubmitted();
+    error SupplierCannotBeReceiver();
+    error OnlyRejectedDeliveryCanBeResubmitted();
+    error OnlyOriginalSupplierCanResubmit();
+    error InvalidPageSize();
     error OnlyReceiverCanReview();
     error DeliveryAlreadyReviewed();
-    error RequiredProductNameMissing();
     error InvalidReviewStatus();
-    error DuplicateRequirement();
     error RejectionReasonRequired();
     error ReviewNoteTooLong();
+    error RequirementNotFound();
+    error OnlyReceiverCanCreateRequirement();
+    error OnlyRequiredSupplierCanSubmit();
+    error InvalidComponentCount();
+    error InvalidName();
+    error DuplicateComponent();
+    error RequiredComponentMissing();
+
+    uint256 public constant MAX_TRACE_PAGE_SIZE = 100;
     uint256 public constant MAX_REVIEW_NOTE_BYTES = 1024;
-    mapping(uint256 => string) public reviewNotes;
-    error ChecklistAlreadyFinalized();
-    error ChecklistNotProposed();
-    error ChecklistRevisionChanged();
-    error ChecklistNotFinalized();
-    error ChecklistRevisionNotFound();
-    error NoUpstreamReceiver();
+    uint256 public constant MAX_COMPONENTS = 32;
+    uint256 public constant MAX_NAME_BYTES = 128;
+    uint256 public requirementCount;
+
     struct Requirement {
+        uint256 projectId;
         address supplier;
+        address receiver;
         string productName;
+        string[] requiredComponents;
+        uint256 createdAt;
     }
 
-    struct Checklist {
-        uint256 revision;
-        bool finalized;
-        Requirement[] requirements;
-    }
+    mapping(uint256 => Requirement) private requirements;
+    mapping(uint256 => uint256) public deliveryRequirementIds;
+    mapping(uint256 => string[]) private deliveryComponents;
+    mapping(uint256 => string) public reviewNotes;
 
-    // Exact product names identify deliverables within a project's supplier route.
-    mapping(bytes32 => uint256) public checklistRevisions;
-    mapping(bytes32 => mapping(uint256 => Checklist)) private checklists;
-    mapping(uint256 => uint256) public deliveryChecklistRevisions;
-    event ChecklistProposed(bytes32 indexed key, uint256 revision);
-    event ChecklistFinalized(bytes32 indexed key, uint256 revision, address indexed supplier);
+    event RequirementCreated(
+        uint256 indexed requirementId,
+        uint256 indexed projectId,
+        address indexed supplier,
+        address receiver,
+        string productName,
+        string[] requiredComponents
+    );
 
-    function checklistKey(uint256 projectId, address supplier, string memory productName)
-        public pure returns (bytes32)
-    {
-        return keccak256(abi.encode(projectId, supplier, productName));
-    }
-
-    function getChecklist(uint256 projectId, address supplier, string calldata productName)
-        external view returns (Checklist memory)
-    {
-        bytes32 key = checklistKey(projectId, supplier, productName);
-        return checklists[key][checklistRevisions[key]];
-    }
-
-    // Each proposal creates a new revision. Earlier revisions are never overwritten.
-    function proposeChecklist(uint256 projectId, string calldata productName, Requirement[] calldata items)
-        external
-    {
+    function createRequirement(
+        uint256 projectId,
+        address supplier,
+        string calldata productName,
+        string[] calldata requiredComponents
+    ) external returns (uint256 requirementId) {
         _requireProject(projectId);
-        if (!(parentCompanies[projectId][msg.sender] != address(0))) revert NoUpstreamReceiver();
-        require(bytes(productName).length > 0, "Product name required");
-        bytes32 key = checklistKey(projectId, msg.sender, productName);
-        uint256 revision = checklistRevisions[key] + 1;
-        Checklist storage list = checklists[key][revision];
-        for (uint256 i = 0; i < items.length; i++) {
-            require(allowedRoutes[projectId][items[i].supplier][msg.sender], "Requirement must be a direct supplier");
-            if (!(bytes(items[i].productName).length > 0)) revert RequiredProductNameMissing();
-            for (uint256 j = 0; j < i; j++) {
-                if (!(items[j].supplier != items[i].supplier ||
-                    keccak256(bytes(items[j].productName)) != keccak256(bytes(items[i].productName)))) revert DuplicateRequirement();
+        if (!allowedRoutes[projectId][supplier][msg.sender])
+            revert OnlyReceiverCanCreateRequirement();
+        _validateName(productName);
+        _validateComponents(requiredComponents);
+        requirementId = ++requirementCount;
+        Requirement storage item = requirements[requirementId];
+        item.projectId = projectId;
+        item.supplier = supplier;
+        item.receiver = msg.sender;
+        item.productName = productName;
+        item.createdAt = block.timestamp;
+        for (uint256 i = 0; i < requiredComponents.length; i++) {
+            item.requiredComponents.push(requiredComponents[i]);
+        }
+        emit RequirementCreated(
+            requirementId,
+            projectId,
+            supplier,
+            msg.sender,
+            productName,
+            requiredComponents
+        );
+    }
+
+    function getRequirement(
+        uint256 requirementId
+    ) external view returns (Requirement memory) {
+        _requireRequirement(requirementId);
+        return requirements[requirementId];
+    }
+
+    function getDeliverySubmission(
+        uint256 deliveryId
+    )
+        external
+        view
+        returns (uint256 requirementId, string[] memory submittedComponents)
+    {
+        _requireDelivery(deliveryId);
+        return (
+            deliveryRequirementIds[deliveryId],
+            deliveryComponents[deliveryId]
+        );
+    }
+
+    function _requireRequirement(uint256 requirementId) private view {
+        if (requirementId == 0 || requirementId > requirementCount)
+            revert RequirementNotFound();
+    }
+
+    function _validateName(string memory name) private pure {
+        bytes memory value = bytes(name);
+        if (value.length == 0 || value.length > MAX_NAME_BYTES)
+            revert InvalidName();
+        uint256 i;
+        while (i < value.length) {
+            uint8 current = uint8(value[i]);
+            if (current <= 32) {
+                i++;
+            } else if (
+                current == 0xc2 && i + 1 < value.length && value[i + 1] == 0xa0
+            ) {
+                i += 2;
+            } else if (
+                current == 0xe3 &&
+                i + 2 < value.length &&
+                value[i + 1] == 0x80 &&
+                value[i + 2] == 0x80
+            ) {
+                i += 3;
+            } else {
+                return;
             }
         }
-        for (uint256 i = 0; i < items.length; i++) {
-            list.requirements.push(items[i]);
+        revert InvalidName();
+    }
+
+    function _validateComponents(string[] calldata components) private pure {
+        if (components.length == 0 || components.length > MAX_COMPONENTS)
+            revert InvalidComponentCount();
+        for (uint256 i = 0; i < components.length; i++) {
+            _validateName(components[i]);
+            for (uint256 j = 0; j < i; j++) {
+                if (
+                    keccak256(bytes(components[i])) ==
+                    keccak256(bytes(components[j]))
+                ) revert DuplicateComponent();
+            }
         }
-        list.revision = revision;
-        checklistRevisions[key] = revision;
-        emit ChecklistProposed(key, list.revision);
     }
 
-    function getChecklistRevision(uint256 projectId, address supplier, string calldata productName, uint256 revision)
-        external view returns (Checklist memory)
-    {
-        bytes32 key = checklistKey(projectId, supplier, productName);
-        if (!(revision > 0 && revision <= checklistRevisions[key])) revert ChecklistRevisionNotFound();
-        return checklists[key][revision];
-    }
-
-    function finalizeChecklist(uint256 projectId, string calldata productName, uint256 expectedRevision)
-        external
-    {
-        _requireProject(projectId);
-        if (!(parentCompanies[projectId][msg.sender] != address(0))) revert NoUpstreamReceiver();
-        bytes32 key = checklistKey(projectId, msg.sender, productName);
-        uint256 revision = checklistRevisions[key];
-        if (!(revision > 0)) revert ChecklistNotProposed();
-        if (!(revision == expectedRevision)) revert ChecklistRevisionChanged();
-        Checklist storage list = checklists[key][revision];
-        if (!(!list.finalized)) revert ChecklistAlreadyFinalized();
-        list.finalized = true;
-        emit ChecklistFinalized(key, revision, msg.sender);
-    }
-
-    function _validateChecklist(uint256 projectId, string memory productName, uint256[] calldata previousIds)
-        private view
-    {
-        bytes32 key = checklistKey(projectId, msg.sender, productName);
-        Checklist storage list = checklists[key][checklistRevisions[key]];
-        if (!(list.finalized)) revert ChecklistNotFinalized();
-        for (uint256 i = 0; i < list.requirements.length; i++) {
-            Requirement storage item = list.requirements[i];
+    function _validateRequiredComponents(
+        Requirement storage item,
+        string[] calldata components
+    ) private view {
+        _validateComponents(components);
+        for (uint256 i = 0; i < item.requiredComponents.length; i++) {
             bool found;
-            for (uint256 j = 0; j < previousIds.length; j++) {
-                Delivery storage previous = deliveries[previousIds[j]];
-                if (previous.supplier == item.supplier &&
-                    keccak256(bytes(previous.productName)) == keccak256(bytes(item.productName))) {
+            for (uint256 j = 0; j < components.length; j++) {
+                if (
+                    keccak256(bytes(item.requiredComponents[i])) ==
+                    keccak256(bytes(components[j]))
+                ) {
                     found = true;
                     break;
                 }
             }
-            require(found, "Required delivery missing");
+            if (!found) revert RequiredComponentMissing();
         }
     }
 
@@ -131,7 +182,6 @@ contract DeliveryRegistry {
 
     struct Delivery {
         uint256 projectId;
-        // Supplier depth from the customer, not chronological delivery order.
         uint256 stage;
         uint256 stageDeliveryNumber;
         address supplier;
@@ -145,12 +195,18 @@ contract DeliveryRegistry {
         uint256 reviewedAt;
     }
 
-    address public immutable admin;
+    struct ProjectDelivery {
+        uint256 deliveryId;
+        string deliveryNumber;
+        address supplier;
+        address receiver;
+        Status status;
+        string[] previousDeliveryNumbers;
+    }
 
     mapping(address => bool) public registeredCompanies;
     mapping(uint256 => mapping(address => bool)) public projectMembers;
     mapping(uint256 => mapping(address => address)) public parentCompanies;
-    // Customer depth is 0; its direct suppliers have depth 1.
     mapping(uint256 => mapping(address => uint256)) public companyDepths;
 
     uint256 public projectCount;
@@ -166,10 +222,16 @@ contract DeliveryRegistry {
         public routeStages;
 
     mapping(uint256 => uint256) public projectDeliveryCounts;
+    mapping(uint256 => uint256[]) private projectDeliveryIds;
 
     mapping(uint256 => mapping(uint256 => uint256)) public stageDeliveryCounts;
 
     mapping(uint256 => uint256[]) private previousDeliveryIds;
+    mapping(uint256 => uint256[]) private nextDeliveryIds;
+    event DeliveryLinked(
+        uint256 indexed previousDeliveryId,
+        uint256 indexed nextDeliveryId
+    );
 
     mapping(uint256 => mapping(uint256 => mapping(uint256 => uint256)))
         private deliveryIdsByProject;
@@ -197,7 +259,8 @@ contract DeliveryRegistry {
         uint256 stage,
         uint256 stageDeliveryNumber,
         address indexed supplier,
-        address receiver
+        address receiver,
+        uint256 requirementId
     );
 
     event DeliveryReviewed(
@@ -216,16 +279,10 @@ contract DeliveryRegistry {
         address indexed supplier
     );
 
-    constructor() {
-        admin = msg.sender;
-    }
-
-    function registerCompany(address company) external {
-        require(msg.sender == admin, "Only admin");
-        require(company != address(0), "Invalid address");
-        require(!registeredCompanies[company], "Company already registered");
-        registeredCompanies[company] = true;
-        emit CompanyRegistered(company);
+    function registerCompany() external {
+        require(!registeredCompanies[msg.sender], "Company already registered");
+        registeredCompanies[msg.sender] = true;
+        emit CompanyRegistered(msg.sender);
     }
 
     function createProject(string calldata name) external returns (uint256) {
@@ -248,19 +305,13 @@ contract DeliveryRegistry {
         return projectId;
     }
 
-    function addSupplier(
-        uint256 projectId,
-        address supplier
-    ) external {
+    function addSupplier(uint256 projectId, address supplier) external {
         _requireProject(projectId);
         require(projectMembers[projectId][msg.sender], "Not a project member");
-        require(registeredCompanies[supplier], "Company not registered");
-        require(
-            supplier != msg.sender,
-            "Supplier and receiver cannot be the same"
-        );
-        // Adding only new members prevents cycles and multiple parents.
-        require(!projectMembers[projectId][supplier], "Company already in project");
+        require(supplier != address(0), "Invalid address");
+        if (!(supplier != msg.sender)) revert SupplierCannotBeReceiver();
+        if (!(!projectMembers[projectId][supplier]))
+            revert CompanyAlreadyInProject();
         address receiver = msg.sender;
         uint256 stage = companyDepths[projectId][receiver] + 1;
         projectMembers[projectId][supplier] = true;
@@ -270,82 +321,82 @@ contract DeliveryRegistry {
         allowedRoutes[projectId][supplier][receiver] = true;
         routeStages[projectId][supplier][receiver] = stage;
 
+        if (!registeredCompanies[supplier]) {
+            registeredCompanies[supplier] = true;
+            emit CompanyRegistered(supplier);
+        }
+
         emit RouteAllowed(projectId, supplier, receiver, stage);
     }
 
     function submitDelivery(
-        uint256 projectId,
-        address receiver,
-        string memory productName,
+        uint256 requirementId,
         string memory version,
         bytes32 sbomHash,
         bytes32 fileHash,
+        string[] calldata submittedComponents,
         uint256[] calldata previousIds
-    ) public returns (uint256) {
-        _requireProject(projectId);
-
+    ) public returns (uint256 deliveryId) {
+        _requireRequirement(requirementId);
+        Requirement storage item = requirements[requirementId];
+        if (msg.sender != item.supplier) revert OnlyRequiredSupplierCanSubmit();
         require(
-            allowedRoutes[projectId][msg.sender][receiver],
+            allowedRoutes[item.projectId][msg.sender][item.receiver],
             "Route not allowed"
         );
-
-        require(bytes(productName).length > 0, "Product name required");
         require(bytes(version).length > 0, "Version required");
         require(sbomHash != bytes32(0), "SBOM hash required");
         require(fileHash != bytes32(0), "File hash required");
-
+        _validateRequiredComponents(item, submittedComponents);
         _validatePreviousDeliveries(
-            projectId,
-            routeStages[projectId][msg.sender][receiver],
+            item.projectId,
+            routeStages[item.projectId][msg.sender][item.receiver],
             previousIds
         );
-        _validateChecklist(projectId, productName, previousIds);
 
-        deliveryCount++;
-
-        uint256 deliveryId = deliveryCount;
-
+        deliveryId = ++deliveryCount;
         Delivery storage delivery = deliveries[deliveryId];
-
-        delivery.projectId = projectId;
-        delivery.stage = routeStages[projectId][msg.sender][receiver];
-
-        projectDeliveryCounts[projectId]++;
-        stageDeliveryCounts[projectId][delivery.stage]++;
-
-        delivery.stageDeliveryNumber = stageDeliveryCounts[projectId][
+        delivery.projectId = item.projectId;
+        delivery.stage = routeStages[item.projectId][msg.sender][item.receiver];
+        projectDeliveryCounts[item.projectId]++;
+        delivery.stageDeliveryNumber = ++stageDeliveryCounts[item.projectId][
             delivery.stage
         ];
-
         delivery.supplier = msg.sender;
-        delivery.receiver = receiver;
-        delivery.productName = productName;
+        delivery.receiver = item.receiver;
+        delivery.productName = item.productName;
         delivery.version = version;
         delivery.sbomHash = sbomHash;
         delivery.fileHash = fileHash;
         delivery.status = Status.Pending;
         delivery.submittedAt = block.timestamp;
-        delivery.reviewedAt = 0;
-
+        deliveryRequirementIds[deliveryId] = requirementId;
+        for (uint256 i = 0; i < submittedComponents.length; i++) {
+            deliveryComponents[deliveryId].push(submittedComponents[i]);
+        }
         _finishSubmission(deliveryId, previousIds);
-
-        return deliveryId;
     }
 
-    function reviewDelivery(uint256 deliveryId, Status status, string calldata note) external {
+    function reviewDelivery(
+        uint256 deliveryId,
+        Status status,
+        string calldata note
+    ) external {
         _requireDelivery(deliveryId);
 
         Delivery storage delivery = deliveries[deliveryId];
 
         if (!(msg.sender == delivery.receiver)) revert OnlyReceiverCanReview();
 
-        if (!(delivery.status == Status.Pending)) revert DeliveryAlreadyReviewed();
+        if (!(delivery.status == Status.Pending))
+            revert DeliveryAlreadyReviewed();
 
-        if (!(
-            status == Status.Approved || status == Status.Rejected)) revert InvalidReviewStatus();
+        if (!(status == Status.Approved || status == Status.Rejected))
+            revert InvalidReviewStatus();
 
         bytes memory noteBytes = bytes(note);
-        if (noteBytes.length > MAX_REVIEW_NOTE_BYTES) revert ReviewNoteTooLong();
+        if (noteBytes.length > MAX_REVIEW_NOTE_BYTES)
+            revert ReviewNoteTooLong();
         if (status == Status.Rejected) {
             bool hasContent;
             for (uint256 i = 0; i < noteBytes.length; i++) {
@@ -371,6 +422,63 @@ contract DeliveryRegistry {
         );
     }
 
+    function getProject(
+        uint256 projectId,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (Project memory info, ProjectDelivery[] memory items, uint256 total) {
+        _requireProject(projectId);
+        if (limit == 0 || limit > MAX_TRACE_PAGE_SIZE) revert InvalidPageSize();
+        info = projects[projectId];
+        uint256[] storage ids = projectDeliveryIds[projectId];
+        total = ids.length;
+        uint256 count;
+        if (offset < total) {
+            count = total - offset;
+            if (count > limit) count = limit;
+        }
+        items = new ProjectDelivery[](count);
+        for (uint256 i = 0; i < count; i++) {
+            uint256 id = ids[offset + i];
+            Delivery storage delivery = deliveries[id];
+            uint256[] storage previous = previousDeliveryIds[id];
+            string[] memory numbers = new string[](previous.length);
+            for (uint256 j = 0; j < previous.length; j++) {
+                numbers[j] = _deliveryNumber(previous[j]);
+            }
+            items[i] = ProjectDelivery({
+                deliveryId: id,
+                deliveryNumber: _deliveryNumber(id),
+                supplier: delivery.supplier,
+                receiver: delivery.receiver,
+                status: delivery.status,
+                previousDeliveryNumbers: numbers
+            });
+        }
+    }
+
+    function _deliveryNumber(uint256 deliveryId) private view returns (string memory) {
+        Delivery storage delivery = deliveries[deliveryId];
+        return string.concat(
+            _decimal(delivery.projectId), "-",
+            _decimal(delivery.stage), "-",
+            _decimal(delivery.stageDeliveryNumber)
+        );
+    }
+
+    function _decimal(uint256 value) private pure returns (string memory) {
+        uint256 length = 1;
+        for (uint256 remaining = value; remaining >= 10; remaining /= 10) {
+            length++;
+        }
+        bytes memory result = new bytes(length);
+        do {
+            result[--length] = bytes1(uint8(48 + value % 10));
+            value /= 10;
+        } while (length > 0);
+        return string(result);
+    }
+
     function getDelivery(
         uint256 deliveryId
     ) external view returns (Delivery memory) {
@@ -385,6 +493,21 @@ contract DeliveryRegistry {
         _requireDelivery(deliveryId);
 
         return previousDeliveryIds[deliveryId];
+    }
+    function getNextDeliveryIds(
+        uint256 deliveryId,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (uint256[] memory ids, uint256 total) {
+        _requireDelivery(deliveryId);
+        if (limit == 0 || limit > MAX_TRACE_PAGE_SIZE) revert InvalidPageSize();
+        uint256[] storage next = nextDeliveryIds[deliveryId];
+        total = next.length;
+        if (offset >= total) return (new uint256[](0), total);
+        uint256 count = total - offset;
+        if (count > limit) count = limit;
+        ids = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) ids[i] = next[offset + i];
     }
 
     function getDeliveryId(
@@ -449,9 +572,11 @@ contract DeliveryRegistry {
         Delivery storage delivery = deliveries[deliveryId];
 
         previousDeliveryIds[deliveryId] = previousIds;
-        deliveryChecklistRevisions[deliveryId] = checklistRevisions[
-            checklistKey(delivery.projectId, delivery.supplier, delivery.productName)
-        ];
+        projectDeliveryIds[delivery.projectId].push(deliveryId);
+        for (uint256 i = 0; i < previousIds.length; i++) {
+            nextDeliveryIds[previousIds[i]].push(deliveryId);
+            emit DeliveryLinked(previousIds[i], deliveryId);
+        }
 
         deliveryIdsByProject[delivery.projectId][delivery.stage][
             delivery.stageDeliveryNumber
@@ -463,7 +588,8 @@ contract DeliveryRegistry {
             delivery.stage,
             delivery.stageDeliveryNumber,
             delivery.supplier,
-            delivery.receiver
+            delivery.receiver,
+            deliveryRequirementIds[deliveryId]
         );
     }
     function resubmitDelivery(
@@ -471,34 +597,28 @@ contract DeliveryRegistry {
         string calldata version,
         bytes32 sbomHash,
         bytes32 fileHash,
+        string[] calldata submittedComponents,
         uint256[] calldata previousIds
     ) external returns (uint256) {
         _requireDelivery(originalDeliveryId);
 
         Delivery storage original = deliveries[originalDeliveryId];
 
-        require(
-            msg.sender == original.supplier,
-            "Only original supplier can resubmit"
-        );
+        if (!(msg.sender == original.supplier))
+            revert OnlyOriginalSupplierCanResubmit();
 
-        require(
-            original.status == Status.Rejected,
-            "Only rejected delivery can be resubmitted"
-        );
+        if (!(original.status == Status.Rejected))
+            revert OnlyRejectedDeliveryCanBeResubmitted();
 
-        require(
-            resubmittedDeliveryIds[originalDeliveryId] == 0,
-            "Delivery already resubmitted"
-        );
+        if (!(resubmittedDeliveryIds[originalDeliveryId] == 0))
+            revert DeliveryAlreadyResubmitted();
 
         uint256 newDeliveryId = submitDelivery(
-            original.projectId,
-            original.receiver,
-            original.productName,
+            deliveryRequirementIds[originalDeliveryId],
             version,
             sbomHash,
             fileHash,
+            submittedComponents,
             previousIds
         );
 
