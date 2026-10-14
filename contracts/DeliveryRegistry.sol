@@ -28,7 +28,10 @@ contract DeliveryRegistry {
     uint256 public requirementCount;
 
     struct Requirement {
+        string requirementId;
         uint256 projectId;
+        uint256 stage;
+        uint256 sequence;
         address supplier;
         address receiver;
         string productName;
@@ -36,13 +39,13 @@ contract DeliveryRegistry {
         uint256 createdAt;
     }
 
-    mapping(uint256 => Requirement) private requirements;
-    mapping(uint256 => uint256) public deliveryRequirementIds;
-    mapping(uint256 => string[]) private deliveryComponents;
-    mapping(uint256 => string) public reviewNotes;
+    mapping(string => Requirement) private requirements;
+    mapping(uint256 => mapping(uint256 => uint256)) private requirementSequences;
+    mapping(string => string[]) private deliveryComponents;
+    mapping(string => string) private _reviewNotes;
 
     event RequirementCreated(
-        uint256 indexed requirementId,
+        string requirementId,
         uint256 indexed projectId,
         address indexed supplier,
         address receiver,
@@ -55,14 +58,20 @@ contract DeliveryRegistry {
         address supplier,
         string calldata productName,
         string[] calldata requiredComponents
-    ) external returns (uint256 requirementId) {
+    ) external returns (string memory requirementId) {
         _requireProject(projectId);
-        if (!allowedRoutes[projectId][supplier][msg.sender])
+        if (!_allowedRoutes[projectId][supplier][msg.sender])
             revert OnlyReceiverCanCreateRequirement();
         _validateName(productName);
         _validateComponents(requiredComponents);
-        requirementId = ++requirementCount;
+        requirementCount++;
+        uint256 stage = _routeStages[projectId][supplier][msg.sender];
+        uint256 sequence = ++requirementSequences[projectId][stage];
+        requirementId = _formatId(projectId, stage, sequence);
         Requirement storage item = requirements[requirementId];
+        item.requirementId = requirementId;
+        item.stage = stage;
+        item.sequence = sequence;
         item.projectId = projectId;
         item.supplier = supplier;
         item.receiver = msg.sender;
@@ -82,28 +91,34 @@ contract DeliveryRegistry {
     }
 
     function getRequirement(
-        uint256 requirementId
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence
     ) external view returns (Requirement memory) {
+        _requireProjectMember(projectId);
+        string memory requirementId = _formatId(projectId, stage, sequence);
         _requireRequirement(requirementId);
         return requirements[requirementId];
     }
 
     function getDeliverySubmission(
-        uint256 deliveryId
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence
     )
         external
         view
-        returns (uint256 requirementId, string[] memory submittedComponents)
+        returns (string memory requirementId, string[] memory submittedComponents)
     {
-        _requireDelivery(deliveryId);
+        string memory deliveryId = _readDeliveryId(projectId, stage, sequence);
         return (
-            deliveryRequirementIds[deliveryId],
+            _deliveries[deliveryId].requirementId,
             deliveryComponents[deliveryId]
         );
     }
 
-    function _requireRequirement(uint256 requirementId) private view {
-        if (requirementId == 0 || requirementId > requirementCount)
+    function _requireRequirement(string memory requirementId) private view {
+        if (requirements[requirementId].projectId == 0)
             revert RequirementNotFound();
     }
 
@@ -181,6 +196,8 @@ contract DeliveryRegistry {
     }
 
     struct Delivery {
+        string deliveryId;
+        string requirementId;
         uint256 projectId;
         uint256 stage;
         uint256 stageDeliveryNumber;
@@ -196,48 +213,45 @@ contract DeliveryRegistry {
     }
 
     struct ProjectDelivery {
-        uint256 deliveryId;
-        string deliveryNumber;
+        string deliveryId;
+        string requirementId;
         address supplier;
         address receiver;
         Status status;
-        string[] previousDeliveryNumbers;
+        string[] previousDeliveryIds;
     }
 
     mapping(address => bool) public registeredCompanies;
-    mapping(uint256 => mapping(address => bool)) public projectMembers;
-    mapping(uint256 => mapping(address => address)) public parentCompanies;
-    mapping(uint256 => mapping(address => uint256)) public companyDepths;
+    mapping(uint256 => mapping(address => bool)) private _projectMembers;
+    mapping(uint256 => mapping(address => address)) private _parentCompanies;
+    mapping(uint256 => mapping(address => uint256)) private _companyDepths;
 
     uint256 public projectCount;
     uint256 public deliveryCount;
 
-    mapping(uint256 => Project) public projects;
-    mapping(uint256 => Delivery) public deliveries;
+    mapping(uint256 => Project) private _projects;
+    mapping(string => Delivery) private _deliveries;
 
     mapping(uint256 => mapping(address => mapping(address => bool)))
-        public allowedRoutes;
+        private _allowedRoutes;
 
     mapping(uint256 => mapping(address => mapping(address => uint256)))
-        public routeStages;
+        private _routeStages;
 
-    mapping(uint256 => uint256) public projectDeliveryCounts;
-    mapping(uint256 => uint256[]) private projectDeliveryIds;
+    mapping(uint256 => uint256) private _projectDeliveryCounts;
+    mapping(uint256 => string[]) private projectDeliveryIds;
 
-    mapping(uint256 => mapping(uint256 => uint256)) public stageDeliveryCounts;
+    mapping(uint256 => mapping(uint256 => uint256)) private _stageDeliveryCounts;
 
-    mapping(uint256 => uint256[]) private previousDeliveryIds;
-    mapping(uint256 => uint256[]) private nextDeliveryIds;
+    mapping(string => string[]) private previousDeliveryIds;
+    mapping(string => string[]) private nextDeliveryIds;
     event DeliveryLinked(
-        uint256 indexed previousDeliveryId,
-        uint256 indexed nextDeliveryId
+        string previousDeliveryId,
+        string nextDeliveryId
     );
 
-    mapping(uint256 => mapping(uint256 => mapping(uint256 => uint256)))
-        private deliveryIdsByProject;
-
-    mapping(uint256 => uint256) public replacesDeliveryIds;
-    mapping(uint256 => uint256) public resubmittedDeliveryIds;
+    mapping(string => string) private _replacesDeliveryIds;
+    mapping(string => string) private _resubmittedDeliveryIds;
 
     event CompanyRegistered(address indexed company);
     event ProjectCreated(
@@ -254,17 +268,17 @@ contract DeliveryRegistry {
     );
 
     event DeliverySubmitted(
-        uint256 indexed deliveryId,
+        string deliveryId,
         uint256 indexed projectId,
         uint256 stage,
         uint256 stageDeliveryNumber,
         address indexed supplier,
         address receiver,
-        uint256 requirementId
+        string requirementId
     );
 
     event DeliveryReviewed(
-        uint256 indexed deliveryId,
+        string deliveryId,
         uint256 indexed projectId,
         uint256 stage,
         uint256 stageDeliveryNumber,
@@ -274,8 +288,8 @@ contract DeliveryRegistry {
     );
 
     event DeliveryResubmitted(
-        uint256 indexed originalDeliveryId,
-        uint256 indexed newDeliveryId,
+        string originalDeliveryId,
+        string newDeliveryId,
         address indexed supplier
     );
 
@@ -293,12 +307,12 @@ contract DeliveryRegistry {
 
         uint256 projectId = projectCount;
 
-        projects[projectId] = Project({
+        _projects[projectId] = Project({
             name: name,
             customer: msg.sender,
             createdAt: block.timestamp
         });
-        projectMembers[projectId][msg.sender] = true;
+        _projectMembers[projectId][msg.sender] = true;
 
         emit ProjectCreated(projectId, name, msg.sender);
 
@@ -307,19 +321,19 @@ contract DeliveryRegistry {
 
     function addSupplier(uint256 projectId, address supplier) external {
         _requireProject(projectId);
-        require(projectMembers[projectId][msg.sender], "Not a project member");
+        require(_projectMembers[projectId][msg.sender], "Not a project member");
         require(supplier != address(0), "Invalid address");
         if (!(supplier != msg.sender)) revert SupplierCannotBeReceiver();
-        if (!(!projectMembers[projectId][supplier]))
+        if (!(!_projectMembers[projectId][supplier]))
             revert CompanyAlreadyInProject();
         address receiver = msg.sender;
-        uint256 stage = companyDepths[projectId][receiver] + 1;
-        projectMembers[projectId][supplier] = true;
-        parentCompanies[projectId][supplier] = receiver;
-        companyDepths[projectId][supplier] = stage;
+        uint256 stage = _companyDepths[projectId][receiver] + 1;
+        _projectMembers[projectId][supplier] = true;
+        _parentCompanies[projectId][supplier] = receiver;
+        _companyDepths[projectId][supplier] = stage;
 
-        allowedRoutes[projectId][supplier][receiver] = true;
-        routeStages[projectId][supplier][receiver] = stage;
+        _allowedRoutes[projectId][supplier][receiver] = true;
+        _routeStages[projectId][supplier][receiver] = stage;
 
         if (!registeredCompanies[supplier]) {
             registeredCompanies[supplier] = true;
@@ -330,18 +344,18 @@ contract DeliveryRegistry {
     }
 
     function submitDelivery(
-        uint256 requirementId,
+        string memory requirementId,
         string memory version,
         bytes32 sbomHash,
         bytes32 fileHash,
         string[] calldata submittedComponents,
-        uint256[] calldata previousIds
-    ) public returns (uint256 deliveryId) {
+        string[] calldata previousIds
+    ) public returns (string memory deliveryId) {
         _requireRequirement(requirementId);
         Requirement storage item = requirements[requirementId];
         if (msg.sender != item.supplier) revert OnlyRequiredSupplierCanSubmit();
         require(
-            allowedRoutes[item.projectId][msg.sender][item.receiver],
+            _allowedRoutes[item.projectId][msg.sender][item.receiver],
             "Route not allowed"
         );
         require(bytes(version).length > 0, "Version required");
@@ -350,18 +364,20 @@ contract DeliveryRegistry {
         _validateRequiredComponents(item, submittedComponents);
         _validatePreviousDeliveries(
             item.projectId,
-            routeStages[item.projectId][msg.sender][item.receiver],
+            _routeStages[item.projectId][msg.sender][item.receiver],
             previousIds
         );
 
-        deliveryId = ++deliveryCount;
-        Delivery storage delivery = deliveries[deliveryId];
+        deliveryCount++;
+        uint256 stage = _routeStages[item.projectId][msg.sender][item.receiver];
+        uint256 sequence = ++_stageDeliveryCounts[item.projectId][stage];
+        deliveryId = _formatId(item.projectId, stage, sequence);
+        Delivery storage delivery = _deliveries[deliveryId];
+        delivery.deliveryId = deliveryId;
         delivery.projectId = item.projectId;
-        delivery.stage = routeStages[item.projectId][msg.sender][item.receiver];
-        projectDeliveryCounts[item.projectId]++;
-        delivery.stageDeliveryNumber = ++stageDeliveryCounts[item.projectId][
-            delivery.stage
-        ];
+        delivery.stage = stage;
+        _projectDeliveryCounts[item.projectId]++;
+        delivery.stageDeliveryNumber = sequence;
         delivery.supplier = msg.sender;
         delivery.receiver = item.receiver;
         delivery.productName = item.productName;
@@ -370,7 +386,7 @@ contract DeliveryRegistry {
         delivery.fileHash = fileHash;
         delivery.status = Status.Pending;
         delivery.submittedAt = block.timestamp;
-        deliveryRequirementIds[deliveryId] = requirementId;
+        _deliveries[deliveryId].requirementId = requirementId;
         for (uint256 i = 0; i < submittedComponents.length; i++) {
             deliveryComponents[deliveryId].push(submittedComponents[i]);
         }
@@ -378,13 +394,15 @@ contract DeliveryRegistry {
     }
 
     function reviewDelivery(
-        uint256 deliveryId,
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence,
         Status status,
         string calldata note
     ) external {
-        _requireDelivery(deliveryId);
+        string memory deliveryId = _resolveDeliveryId(projectId, stage, sequence);
 
-        Delivery storage delivery = deliveries[deliveryId];
+        Delivery storage delivery = _deliveries[deliveryId];
 
         if (!(msg.sender == delivery.receiver)) revert OnlyReceiverCanReview();
 
@@ -407,7 +425,7 @@ contract DeliveryRegistry {
             }
             if (!hasContent) revert RejectionReasonRequired();
         }
-        reviewNotes[deliveryId] = note;
+        _reviewNotes[deliveryId] = note;
         delivery.status = status;
         delivery.reviewedAt = block.timestamp;
 
@@ -427,10 +445,10 @@ contract DeliveryRegistry {
         uint256 offset,
         uint256 limit
     ) external view returns (Project memory info, ProjectDelivery[] memory items, uint256 total) {
-        _requireProject(projectId);
+        _requireProjectMember(projectId);
         if (limit == 0 || limit > MAX_TRACE_PAGE_SIZE) revert InvalidPageSize();
-        info = projects[projectId];
-        uint256[] storage ids = projectDeliveryIds[projectId];
+        info = _projects[projectId];
+        string[] storage ids = projectDeliveryIds[projectId];
         total = ids.length;
         uint256 count;
         if (offset < total) {
@@ -439,31 +457,21 @@ contract DeliveryRegistry {
         }
         items = new ProjectDelivery[](count);
         for (uint256 i = 0; i < count; i++) {
-            uint256 id = ids[offset + i];
-            Delivery storage delivery = deliveries[id];
-            uint256[] storage previous = previousDeliveryIds[id];
-            string[] memory numbers = new string[](previous.length);
-            for (uint256 j = 0; j < previous.length; j++) {
-                numbers[j] = _deliveryNumber(previous[j]);
-            }
+            string memory id = ids[offset + i];
+            Delivery storage delivery = _deliveries[id];
             items[i] = ProjectDelivery({
                 deliveryId: id,
-                deliveryNumber: _deliveryNumber(id),
+                requirementId: delivery.requirementId,
                 supplier: delivery.supplier,
                 receiver: delivery.receiver,
                 status: delivery.status,
-                previousDeliveryNumbers: numbers
+                previousDeliveryIds: previousDeliveryIds[id]
             });
         }
     }
 
-    function _deliveryNumber(uint256 deliveryId) private view returns (string memory) {
-        Delivery storage delivery = deliveries[deliveryId];
-        return string.concat(
-            _decimal(delivery.projectId), "-",
-            _decimal(delivery.stage), "-",
-            _decimal(delivery.stageDeliveryNumber)
-        );
+    function _formatId(uint256 projectId, uint256 stage, uint256 sequence) private pure returns (string memory) {
+        return string.concat(_decimal(projectId), "-", _decimal(stage), "-", _decimal(sequence));
     }
 
     function _decimal(uint256 value) private pure returns (string memory) {
@@ -480,33 +488,39 @@ contract DeliveryRegistry {
     }
 
     function getDelivery(
-        uint256 deliveryId
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence
     ) external view returns (Delivery memory) {
-        _requireDelivery(deliveryId);
+        string memory deliveryId = _readDeliveryId(projectId, stage, sequence);
 
-        return deliveries[deliveryId];
+        return _deliveries[deliveryId];
     }
 
     function getPreviousDeliveryIds(
-        uint256 deliveryId
-    ) external view returns (uint256[] memory) {
-        _requireDelivery(deliveryId);
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence
+    ) external view returns (string[] memory) {
+        string memory deliveryId = _readDeliveryId(projectId, stage, sequence);
 
         return previousDeliveryIds[deliveryId];
     }
     function getNextDeliveryIds(
-        uint256 deliveryId,
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence,
         uint256 offset,
         uint256 limit
-    ) external view returns (uint256[] memory ids, uint256 total) {
-        _requireDelivery(deliveryId);
+    ) external view returns (string[] memory ids, uint256 total) {
+        string memory deliveryId = _readDeliveryId(projectId, stage, sequence);
         if (limit == 0 || limit > MAX_TRACE_PAGE_SIZE) revert InvalidPageSize();
-        uint256[] storage next = nextDeliveryIds[deliveryId];
+        string[] storage next = nextDeliveryIds[deliveryId];
         total = next.length;
-        if (offset >= total) return (new uint256[](0), total);
+        if (offset >= total) return (new string[](0), total);
         uint256 count = total - offset;
         if (count > limit) count = limit;
-        ids = new uint256[](count);
+        ids = new string[](count);
         for (uint256 i = 0; i < count; i++) ids[i] = next[offset + i];
     }
 
@@ -514,12 +528,21 @@ contract DeliveryRegistry {
         uint256 projectId,
         uint256 stage,
         uint256 sequence
-    ) external view returns (uint256) {
+    ) external view returns (string memory) {
+        return _readDeliveryId(projectId, stage, sequence);
+    }
+
+    function _readDeliveryId(uint256 projectId, uint256 stage, uint256 sequence) private view returns (string memory) {
+        _requireProjectMember(projectId);
+        return _resolveDeliveryId(projectId, stage, sequence);
+    }
+
+    function _resolveDeliveryId(uint256 projectId, uint256 stage, uint256 sequence) private view returns (string memory) {
         _requireProject(projectId);
 
-        uint256 deliveryId = deliveryIdsByProject[projectId][stage][sequence];
+        string memory deliveryId = _formatId(projectId, stage, sequence);
 
-        require(deliveryId != 0, "Delivery not found");
+        _requireDelivery(deliveryId);
 
         return deliveryId;
     }
@@ -527,14 +550,14 @@ contract DeliveryRegistry {
     function _validatePreviousDeliveries(
         uint256 projectId,
         uint256 stage,
-        uint256[] calldata previousIds
+        string[] calldata previousIds
     ) private view {
         for (uint256 i = 0; i < previousIds.length; i++) {
-            uint256 previousId = previousIds[i];
+            string memory previousId = previousIds[i];
 
             _requireDelivery(previousId);
 
-            Delivery storage previous = deliveries[previousId];
+            Delivery storage previous = _deliveries[previousId];
 
             require(
                 previous.projectId == projectId,
@@ -558,7 +581,7 @@ contract DeliveryRegistry {
 
             for (uint256 j = 0; j < i; j++) {
                 require(
-                    previousIds[j] != previousId,
+                    keccak256(bytes(previousIds[j])) != keccak256(bytes(previousId)),
                     "Duplicate previous delivery"
                 );
             }
@@ -566,21 +589,17 @@ contract DeliveryRegistry {
     }
 
     function _finishSubmission(
-        uint256 deliveryId,
-        uint256[] calldata previousIds
+        string memory deliveryId,
+        string[] calldata previousIds
     ) private {
-        Delivery storage delivery = deliveries[deliveryId];
+        Delivery storage delivery = _deliveries[deliveryId];
 
-        previousDeliveryIds[deliveryId] = previousIds;
         projectDeliveryIds[delivery.projectId].push(deliveryId);
         for (uint256 i = 0; i < previousIds.length; i++) {
+            previousDeliveryIds[deliveryId].push(previousIds[i]);
             nextDeliveryIds[previousIds[i]].push(deliveryId);
             emit DeliveryLinked(previousIds[i], deliveryId);
         }
-
-        deliveryIdsByProject[delivery.projectId][delivery.stage][
-            delivery.stageDeliveryNumber
-        ] = deliveryId;
 
         emit DeliverySubmitted(
             deliveryId,
@@ -589,20 +608,35 @@ contract DeliveryRegistry {
             delivery.stageDeliveryNumber,
             delivery.supplier,
             delivery.receiver,
-            deliveryRequirementIds[deliveryId]
+            _deliveries[deliveryId].requirementId
         );
     }
     function resubmitDelivery(
-        uint256 originalDeliveryId,
+        uint256 projectId,
+        uint256 stage,
+        uint256 sequence,
         string calldata version,
         bytes32 sbomHash,
         bytes32 fileHash,
         string[] calldata submittedComponents,
-        uint256[] calldata previousIds
-    ) external returns (uint256) {
-        _requireDelivery(originalDeliveryId);
+        string[] calldata previousIds
+    ) external returns (string memory) {
+        return _resubmitDelivery(
+            _resolveDeliveryId(projectId, stage, sequence),
+            version, sbomHash, fileHash, submittedComponents, previousIds
+        );
+    }
 
-        Delivery storage original = deliveries[originalDeliveryId];
+    function _resubmitDelivery(
+        string memory originalDeliveryId,
+        string calldata version,
+        bytes32 sbomHash,
+        bytes32 fileHash,
+        string[] calldata submittedComponents,
+        string[] calldata previousIds
+    ) private returns (string memory) {
+
+        Delivery storage original = _deliveries[originalDeliveryId];
 
         if (!(msg.sender == original.supplier))
             revert OnlyOriginalSupplierCanResubmit();
@@ -610,11 +644,11 @@ contract DeliveryRegistry {
         if (!(original.status == Status.Rejected))
             revert OnlyRejectedDeliveryCanBeResubmitted();
 
-        if (!(resubmittedDeliveryIds[originalDeliveryId] == 0))
+        if (!(bytes(_resubmittedDeliveryIds[originalDeliveryId]).length == 0))
             revert DeliveryAlreadyResubmitted();
 
-        uint256 newDeliveryId = submitDelivery(
-            deliveryRequirementIds[originalDeliveryId],
+        string memory newDeliveryId = submitDelivery(
+            original.requirementId,
             version,
             sbomHash,
             fileHash,
@@ -622,12 +656,74 @@ contract DeliveryRegistry {
             previousIds
         );
 
-        replacesDeliveryIds[newDeliveryId] = originalDeliveryId;
-        resubmittedDeliveryIds[originalDeliveryId] = newDeliveryId;
+        _replacesDeliveryIds[newDeliveryId] = originalDeliveryId;
+        _resubmittedDeliveryIds[originalDeliveryId] = newDeliveryId;
 
         emit DeliveryResubmitted(originalDeliveryId, newDeliveryId, msg.sender);
 
         return newDeliveryId;
+    }
+
+    function projects(uint256 projectId) external view returns (string memory name, address customer, uint256 createdAt) {
+        _requireProjectMember(projectId);
+        Project storage item = _projects[projectId];
+        return (item.name, item.customer, item.createdAt);
+    }
+
+    function projectMembers(uint256 projectId, address company) external view returns (bool) {
+        _requireProjectMember(projectId);
+        return _projectMembers[projectId][company];
+    }
+
+    function parentCompanies(uint256 projectId, address company) external view returns (address) {
+        _requireProjectMember(projectId);
+        return _parentCompanies[projectId][company];
+    }
+
+    function companyDepths(uint256 projectId, address company) external view returns (uint256) {
+        _requireProjectMember(projectId);
+        return _companyDepths[projectId][company];
+    }
+
+    function allowedRoutes(uint256 projectId, address supplier, address receiver) external view returns (bool) {
+        _requireProjectMember(projectId);
+        return _allowedRoutes[projectId][supplier][receiver];
+    }
+
+    function routeStages(uint256 projectId, address supplier, address receiver) external view returns (uint256) {
+        _requireProjectMember(projectId);
+        return _routeStages[projectId][supplier][receiver];
+    }
+
+    function projectDeliveryCounts(uint256 projectId) external view returns (uint256) {
+        _requireProjectMember(projectId);
+        return _projectDeliveryCounts[projectId];
+    }
+
+    function stageDeliveryCounts(uint256 projectId, uint256 stage) external view returns (uint256) {
+        _requireProjectMember(projectId);
+        return _stageDeliveryCounts[projectId][stage];
+    }
+
+    function deliveryRequirementIds(uint256 projectId, uint256 stage, uint256 sequence) external view returns (string memory) {
+        return _deliveries[_readDeliveryId(projectId, stage, sequence)].requirementId;
+    }
+
+    function reviewNotes(uint256 projectId, uint256 stage, uint256 sequence) external view returns (string memory) {
+        return _reviewNotes[_readDeliveryId(projectId, stage, sequence)];
+    }
+
+    function replacesDeliveryIds(uint256 projectId, uint256 stage, uint256 sequence) external view returns (string memory) {
+        return _replacesDeliveryIds[_readDeliveryId(projectId, stage, sequence)];
+    }
+
+    function resubmittedDeliveryIds(uint256 projectId, uint256 stage, uint256 sequence) external view returns (string memory) {
+        return _resubmittedDeliveryIds[_readDeliveryId(projectId, stage, sequence)];
+    }
+
+    function _requireProjectMember(uint256 projectId) private view {
+        _requireProject(projectId);
+        require(_projectMembers[projectId][msg.sender], "Not a project member");
     }
 
     function _requireProject(uint256 projectId) private view {
@@ -637,9 +733,9 @@ contract DeliveryRegistry {
         );
     }
 
-    function _requireDelivery(uint256 deliveryId) private view {
+    function _requireDelivery(string memory deliveryId) private view {
         require(
-            deliveryId > 0 && deliveryId <= deliveryCount,
+            _deliveries[deliveryId].projectId != 0,
             "Delivery not found"
         );
     }
