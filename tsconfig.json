@@ -1,5 +1,5 @@
 {
-  "exclude": ["node_modules", "dist", "besu-test-network"],
+  "exclude": ["node_modules", "dist", "besu-test-network", "backend"],
   "compilerOptions": {
     "lib": ["es2023"],
     "module": "node20",
