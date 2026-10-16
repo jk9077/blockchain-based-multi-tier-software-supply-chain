@@ -2,6 +2,10 @@
   "name": "sbom-project",
   "version": "1.0.0",
   "type": "module",
+  "scripts": {
+    "server": "node backend/server.ts",
+    "test:backend": "node --test backend/*.test.mjs"
+  },
   "devDependencies": {
     "@nomicfoundation/hardhat-ignition": "^3.1.8",
     "@nomicfoundation/hardhat-toolbox-viem": "^5.0.7",
@@ -10,5 +14,9 @@
     "hardhat": "^3.17.0",
     "typescript": "~6.0.3",
     "viem": "^2.56.8"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.4.0",
+    "fastify": "^5.12.7"
   }
 }
